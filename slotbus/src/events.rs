@@ -40,51 +40,6 @@ const SYNCHRONIZE: u32 = 0x0010_0000;
 #[cfg(windows)]
 const WAIT_OBJECT_0: u32 = 0;
 
-// ---- Unix FFI (POSIX named semaphores) ----
-
-#[cfg(unix)]
-type SemPtr = *mut std::ffi::c_void;
-
-#[cfg(unix)]
-const SEM_FAILED: SemPtr = !0usize as SemPtr;
-
-// O_CREAT differs between Linux and macOS
-#[cfg(target_os = "linux")]
-const O_CREAT: i32 = 0o100;
-#[cfg(target_os = "macos")]
-const O_CREAT: i32 = 0x0200;
-
-#[cfg(unix)]
-extern "C" {
-    fn sem_open(name: *const i8, oflag: i32, mode: u32, value: u32) -> SemPtr;
-    fn sem_close(sem: SemPtr) -> i32;
-    fn sem_unlink(name: *const i8) -> i32;
-    fn sem_post(sem: SemPtr) -> i32;
-}
-
-// macOS uses sem_trywait polling (sem_timedwait is not available)
-#[cfg(target_os = "macos")]
-extern "C" {
-    fn sem_trywait(sem: SemPtr) -> i32;
-}
-
-// Linux has sem_timedwait for efficient timed waits
-#[cfg(target_os = "linux")]
-#[repr(C)]
-struct Timespec {
-    tv_sec: i64,
-    tv_nsec: i64,
-}
-
-#[cfg(target_os = "linux")]
-extern "C" {
-    fn sem_timedwait(sem: SemPtr, abs_timeout: *const Timespec) -> i32;
-    fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
-}
-
-#[cfg(target_os = "linux")]
-const CLOCK_REALTIME: i32 = 0;
-
 /// Auto-reset named event for cross-process signaling.
 ///
 /// On signal, exactly one waiter is released (auto-reset behavior).
@@ -93,7 +48,7 @@ pub struct NamedEvent {
     #[cfg(windows)]
     handle: isize,
     #[cfg(unix)]
-    sem: SemPtr,
+    sem: *mut libc::sem_t,
     #[cfg(unix)]
     name: std::ffi::CString,
     #[cfg(unix)]
@@ -126,17 +81,22 @@ impl NamedEvent {
             let cname = std::ffi::CString::new(format!("/{name}"))
                 .map_err(|e| SlotBusError::Event(format!("invalid name: {e}")))?;
             // Remove stale semaphore from a previous crash (harmless if it doesn't exist)
-            unsafe { sem_unlink(cname.as_ptr()); }
-            let sem = unsafe { sem_open(cname.as_ptr(), O_CREAT, 0o644, 0) };
-            if sem == SEM_FAILED {
+            unsafe {
+                libc::sem_unlink(cname.as_ptr());
+            }
+            let sem =
+                unsafe { libc::sem_open(cname.as_ptr(), libc::O_CREAT, 0o644 as libc::mode_t, 0) };
+            if sem == libc::SEM_FAILED {
                 let errno = std::io::Error::last_os_error();
                 return Err(SlotBusError::Event(format!(
-                    "sem_open(create) failed for '{}' (len {}): {errno}",
-                    cname.to_str().unwrap_or("?"),
-                    cname.to_bytes().len(),
+                    "sem_open(create) failed for '{name}': {errno}"
                 )));
             }
-            Ok(Self { sem, name: cname, created: true })
+            Ok(Self {
+                sem,
+                name: cname,
+                created: true,
+            })
         }
     }
 
@@ -159,13 +119,17 @@ impl NamedEvent {
             let cname = std::ffi::CString::new(format!("/{name}"))
                 .map_err(|e| SlotBusError::Event(format!("invalid name: {e}")))?;
             // Open without O_CREAT — the semaphore must already exist
-            let sem = unsafe { sem_open(cname.as_ptr(), 0, 0, 0) };
-            if sem == SEM_FAILED {
+            let sem = unsafe { libc::sem_open(cname.as_ptr(), 0) };
+            if sem == libc::SEM_FAILED {
                 return Err(SlotBusError::Event(format!(
                     "sem_open(open) failed for '{name}'"
                 )));
             }
-            Ok(Self { sem, name: cname, created: false })
+            Ok(Self {
+                sem,
+                name: cname,
+                created: false,
+            })
         }
     }
 
@@ -177,7 +141,7 @@ impl NamedEvent {
         }
         #[cfg(unix)]
         unsafe {
-            sem_post(self.sem);
+            libc::sem_post(self.sem);
         }
     }
 
@@ -201,15 +165,20 @@ impl NamedEvent {
         // Linux: use sem_timedwait for kernel-level timed wait (sub-microsecond wake)
         #[cfg(target_os = "linux")]
         {
-            let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-            unsafe { clock_gettime(CLOCK_REALTIME, &mut ts); }
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            unsafe {
+                libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
+            }
             ts.tv_sec += (ms / 1000) as i64;
             ts.tv_nsec += ((ms % 1000) as i64) * 1_000_000;
             if ts.tv_nsec >= 1_000_000_000 {
                 ts.tv_sec += 1;
                 ts.tv_nsec -= 1_000_000_000;
             }
-            unsafe { sem_timedwait(self.sem, &ts) == 0 }
+            unsafe { libc::sem_timedwait(self.sem, &ts) == 0 }
         }
         // macOS: sem_timedwait is not available, poll with sem_trywait
         #[cfg(target_os = "macos")]
@@ -217,7 +186,7 @@ impl NamedEvent {
             use std::time::{Duration, Instant};
             let deadline = Instant::now() + Duration::from_millis(ms as u64);
             loop {
-                if unsafe { sem_trywait(self.sem) } == 0 {
+                if unsafe { libc::sem_trywait(self.sem) } == 0 {
                     return true;
                 }
                 if Instant::now() >= deadline {
@@ -237,9 +206,13 @@ impl Drop for NamedEvent {
         }
         #[cfg(unix)]
         {
-            unsafe { sem_close(self.sem); }
+            unsafe {
+                libc::sem_close(self.sem);
+            }
             if self.created {
-                unsafe { sem_unlink(self.name.as_ptr()); }
+                unsafe {
+                    libc::sem_unlink(self.name.as_ptr());
+                }
             }
         }
     }

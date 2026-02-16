@@ -20,6 +20,9 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 tokio = { version = "1", features = ["sync"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { workspace = true }
