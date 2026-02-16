@@ -12,6 +12,40 @@
 
 use crate::error::SlotBusError;
 
+/// macOS has a PSEMNAMLEN limit of 31 characters (including leading `/`).
+/// If a name exceeds this, we hash it to a fixed-length string.
+#[cfg(target_os = "macos")]
+fn sanitize_sem_name(name: &str) -> String {
+    // With leading `/`, the total must be <= 31 chars, so name itself <= 30 chars
+    if name.len() <= 30 {
+        return name.to_string();
+    }
+    // FNV-1a 64-bit hash, encoded as 11 base62 chars
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in name.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    const CHARS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut encoded = String::with_capacity(11);
+    let mut h = hash;
+    for _ in 0..11 {
+        encoded.push(CHARS[(h % 62) as usize] as char);
+        h /= 62;
+    }
+    // "sb-" prefix + 11 hash chars + suffix from original name (e.g. "-req"/"-rsp")
+    // Keep the last 16 chars of the original name for debuggability
+    let suffix_len = 16.min(name.len());
+    let suffix = &name[name.len() - suffix_len..];
+    let result = format!("sb-{encoded}{suffix}");
+    // Ensure we're within the 30-char limit
+    if result.len() > 30 {
+        format!("sb-{encoded}")
+    } else {
+        result
+    }
+}
+
 // ---- Windows FFI ----
 
 #[cfg(windows)]
@@ -118,7 +152,12 @@ impl NamedEvent {
         }
         #[cfg(unix)]
         {
-            let cname = std::ffi::CString::new(format!("/{name}"))
+            #[cfg(target_os = "macos")]
+            let sem_name = sanitize_sem_name(name);
+            #[cfg(not(target_os = "macos"))]
+            let sem_name = name.to_string();
+
+            let cname = std::ffi::CString::new(format!("/{sem_name}"))
                 .map_err(|e| SlotBusError::Event(format!("invalid name: {e}")))?;
             // Remove stale semaphore from a previous crash (harmless if it doesn't exist)
             unsafe { sem_unlink(cname.as_ptr()); }
@@ -148,7 +187,12 @@ impl NamedEvent {
         }
         #[cfg(unix)]
         {
-            let cname = std::ffi::CString::new(format!("/{name}"))
+            #[cfg(target_os = "macos")]
+            let sem_name = sanitize_sem_name(name);
+            #[cfg(not(target_os = "macos"))]
+            let sem_name = name.to_string();
+
+            let cname = std::ffi::CString::new(format!("/{sem_name}"))
                 .map_err(|e| SlotBusError::Event(format!("invalid name: {e}")))?;
             // Open without O_CREAT — the semaphore must already exist
             let sem = unsafe { sem_open(cname.as_ptr(), 0, 0, 0) };
