@@ -8,8 +8,8 @@ edition = "2021"
 rust-version = "1.75"
 authors = ["Justin Zipperle"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/jzipperle/slotbus"
-homepage = "https://github.com/jzipperle/slotbus"
+repository = "https://github.com/JustMaier/slotbus"
+homepage = "https://github.com/JustMaier/slotbus"
 categories = ["network-programming", "concurrency", "os"]
 keywords = ["ipc", "shared-memory", "lock-free", "rpc", "low-latency"]
 

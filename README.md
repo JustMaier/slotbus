@@ -4,7 +4,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/slotbus.svg)](https://crates.io/crates/slotbus)
 [![docs.rs](https://img.shields.io/docsrs/slotbus)](https://docs.rs/slotbus)
-[![CI](https://github.com/jzipperle/slotbus/actions/workflows/ci.yml/badge.svg)](https://github.com/jzipperle/slotbus/actions/workflows/ci.yml)
+[![CI](https://github.com/JustMaier/slotbus/actions/workflows/ci.yml/badge.svg)](https://github.com/JustMaier/slotbus/actions/workflows/ci.yml)
 [![License](https://img.shields.io/crates/l/slotbus.svg)](LICENSE-MIT)
 
 Slotbus provides slotted request/response communication between processes on the same machine. Instead of serializing data through HTTP or Unix sockets, processes read and write directly from shared memory pages with OS-level event signaling. The result is sub-microsecond wake latency and sub-millisecond round-trip times.
@@ -241,9 +241,9 @@ For a worker named `"my-worker"` with the default prefix:
 
 ## slotbus-hub
 
-[`slotbus-hub`](https://github.com/jzipperle/slotbus-hub) is a standalone HTTP-to-SHM router binary built on slotbus. Workers register routes via HTTP; clients send normal HTTP requests; the hub dispatches them through shared memory with sub-millisecond round trips.
+[`slotbus-hub`](https://github.com/JustMaier/slotbus-hub) is a standalone HTTP-to-SHM router binary built on slotbus. Workers register routes via HTTP; clients send normal HTTP requests; the hub dispatches them through shared memory with sub-millisecond round trips.
 
-Install it separately: `cargo install slotbus-hub` — see the [slotbus-hub repo](https://github.com/jzipperle/slotbus-hub) for full documentation.
+Install it separately: `cargo install slotbus-hub` — see the [slotbus-hub repo](https://github.com/JustMaier/slotbus-hub) for full documentation.
 
 ## Comparison
 
@@ -296,7 +296,7 @@ Contributions are welcome. Please open an issue first to discuss what you'd like
 
 ```bash
 # Clone and build
-git clone https://github.com/jzipperle/slotbus.git
+git clone https://github.com/JustMaier/slotbus.git
 cd slotbus
 cargo build
 

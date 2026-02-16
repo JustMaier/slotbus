@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Extracted `slotbus-hub` binary into its own repo: [slotbus-hub](https://github.com/jzipperle/slotbus-hub)
+- Extracted `slotbus-hub` binary into its own repo: [slotbus-hub](https://github.com/JustMaier/slotbus-hub)
 
 ## [0.1.0] - 2026-02-16
 
@@ -22,5 +22,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Zero-copy payload access within shared memory regions
 - Postcard-based binary serialization for slot metadata
 
-[Unreleased]: https://github.com/jzipperle/slotbus/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/jzipperle/slotbus/releases/tag/v0.1.0
+[Unreleased]: https://github.com/JustMaier/slotbus/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/JustMaier/slotbus/releases/tag/v0.1.0
