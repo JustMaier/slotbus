@@ -94,6 +94,11 @@ extern "C" {
     fn sem_close(sem: SemPtr) -> i32;
     fn sem_unlink(name: *const i8) -> i32;
     fn sem_post(sem: SemPtr) -> i32;
+}
+
+// macOS uses sem_trywait polling (sem_timedwait is not available)
+#[cfg(target_os = "macos")]
+extern "C" {
     fn sem_trywait(sem: SemPtr) -> i32;
 }
 
