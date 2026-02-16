@@ -1,11 +1,13 @@
-/// macOS limits POSIX named semaphore and shared memory names to 31 characters
-/// (including the leading `/` that the OS prepends). When names exceed this,
-/// we hash them to a fixed-length string.
+/// macOS limits POSIX named semaphore and shared memory names.
+///
+/// `PSEMNAMLEN = 31` includes the null terminator, so the path passed to
+/// `sem_open`/`shm_open` (which starts with `/`) can be at most 30 bytes.
+/// That means the name portion (after `/`) can be at most **29** characters.
 #[cfg(target_os = "macos")]
 fn sanitize_os_name(name: &str) -> String {
-    // With leading `/`, the total must be <= 31 chars, so name itself <= 30 chars.
-    // shm_open on macOS also has this same limit (PSHMNAMLEN = 31).
-    if name.len() <= 30 {
+    // events.rs prepends "/" — total path must be <= 30 chars, so name <= 29.
+    const MAX_NAME: usize = 29;
+    if name.len() <= MAX_NAME {
         return name.to_string();
     }
     // FNV-1a 64-bit hash, encoded as 11 base62 chars
@@ -21,11 +23,12 @@ fn sanitize_os_name(name: &str) -> String {
         encoded.push(CHARS[(h % 62) as usize] as char);
         h /= 62;
     }
-    // "sb-" (3) + 11 hash chars = 14 chars, leaving 16 for suffix
-    let suffix_len = 16.min(name.len());
+    // "sb-" (3) + 11 hash chars = 14 chars, leaving room for suffix
+    let max_suffix = MAX_NAME - 14;
+    let suffix_len = max_suffix.min(name.len());
     let suffix = &name[name.len() - suffix_len..];
     let result = format!("sb-{encoded}{suffix}");
-    if result.len() > 30 {
+    if result.len() > MAX_NAME {
         format!("sb-{encoded}")
     } else {
         result
