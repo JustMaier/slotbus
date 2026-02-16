@@ -1,15 +1,16 @@
 # slotbus
 
-**Lock-free shared memory IPC for Rust.**
+**Lock-free shared memory IPC for Rust.** Sub-microsecond wake latency. Sub-millisecond round trips. Zero-copy payloads. Drop-in replacement for localhost HTTP in same-machine architectures.
 
 [![CI](https://github.com/JustMaier/slotbus/actions/workflows/ci.yml/badge.svg)](https://github.com/JustMaier/slotbus/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/slotbus.svg)](https://crates.io/crates/slotbus)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
 
-Slotbus provides slotted request/response communication between processes on the same machine. Instead of serializing data through HTTP or Unix sockets, processes read and write directly from shared memory pages with OS-level event signaling. The result is sub-microsecond wake latency and sub-millisecond round-trip times.
+## Why slotbus?
 
-## Performance
+If your services run on the same machine, you're paying for overhead you don't need. HTTP localhost adds 5-20ms of socket copies, HTTP parsing, and serialization per round trip. Unix sockets are better but still kernel-mediated. gRPC layers protobuf and HTTP/2 on top.
 
-Measured on Windows 11, AMD Ryzen 9, DDR5:
+Slotbus eliminates all of it. Processes read and write directly from shared memory pages with OS-level event signaling. The result:
 
 | Metric | slotbus | HTTP localhost | Unix socket | gRPC | shmem-ipc (ring) |
 |---|---|---|---|---|---|
@@ -20,84 +21,18 @@ Measured on Windows 11, AMD Ryzen 9, DDR5:
 | Serialization overhead | postcard (binary) | JSON + HTTP framing | protocol-dependent | protobuf + HTTP/2 | raw bytes |
 | CPU while idle | 0% (event wait) | 0% (epoll/IOCP) | 0% (epoll/IOCP) | 0% (epoll/IOCP) | polling or futex |
 
-Slotbus is 10-50x faster than HTTP localhost for request/response workloads because it eliminates kernel socket copies, HTTP parsing, and serialization round-trips. Data lives in shared memory pages that both processes can access directly.
+*Measured on Windows 11, AMD Ryzen 9, DDR5.*
 
-## Architecture
+**10-50x faster than HTTP localhost** for request/response workloads.
 
-```
-                         Hub Process                              Worker Process
-                    ┌─────────────────────┐                  ┌─────────────────────┐
-                    │     SlotBus          │                  │    SlotWorker        │
-                    │  (hub-side handle)   │                  │  (worker-side handle)│
-                    └────────┬────────────┘                  └────────┬─────────────┘
-                             │                                        │
-                   dispatch_request()                       start_receive_loop()
-                             │                                        │
-          ┌──────────────────▼────────────────────────────────────────▼───────────┐
-          │                    Shared Memory Control Region (1 MB)                │
-          │                                                                      │
-          │  ┌────────────────────────────────────────────────────────────────┐   │
-          │  │  Header (64 bytes)                                            │   │
-          │  │  magic: 0x48554231 | version: 1 | num_slots: 32              │   │
-          │  │  heap_offset | heap_size | alloc_head (AtomicU32)             │   │
-          │  └────────────────────────────────────────────────────────────────┘   │
-          │                                                                      │
-          │  ┌──────────┐ ┌──────────┐ ┌──────────┐         ┌──────────┐        │
-          │  │  Slot 0  │ │  Slot 1  │ │  Slot 2  │  . . .  │  Slot 31 │        │
-          │  │ 128 bytes│ │ 128 bytes│ │ 128 bytes│         │ 128 bytes│        │
-          │  │          │ │          │ │          │         │          │        │
-          │  │ status   │ │ status   │ │ status   │         │ status   │        │
-          │  │ req_id   │ │ req_id   │ │ req_id   │         │ req_id   │        │
-          │  │ method   │ │ method   │ │ method   │         │ method   │        │
-          │  │ meta_ptr │ │ meta_ptr │ │ meta_ptr │         │ meta_ptr │        │
-          │  │ body_ptr │ │ body_ptr │ │ body_ptr │         │ body_ptr │        │
-          │  │ resp_ptr │ │ resp_ptr │ │ resp_ptr │         │ resp_ptr │        │
-          │  └──────────┘ └──────────┘ └──────────┘         └──────────┘        │
-          │                                                                      │
-          │  ┌────────────────────────────────────────────────────────────────┐   │
-          │  │  Inline Heap (~1MB - header - slots)                          │   │
-          │  │  Bump-allocated. Metadata and small bodies written here.      │   │
-          │  │  CAS on alloc_head for thread-safe allocation.                │   │
-          │  │  Auto-reset when all slots are Free.                          │   │
-          │  └────────────────────────────────────────────────────────────────┘   │
-          └──────────────────────────────────────────────────────────────────────┘
+## Use Cases
 
-          ┌──────────────────────────────────────────────────────────────────┐
-          │  Overflow Regions (temporary, per-slot, created on demand)       │
-          │  slotbus-{name}-req-{slot}  — large request bodies              │
-          │  slotbus-{name}-rsp-{slot}  — large response bodies             │
-          └──────────────────────────────────────────────────────────────────┘
-
-          Signaling (zero-polling cross-process wakeup):
-          ┌─────────────────────────────────────────────┐
-          │  slotbus-{name}-req  ──►  wake worker       │   Hub signals after writing Ready slot
-          │  slotbus-{name}-rsp  ──►  wake hub          │   Worker signals after writing Done slot
-          └─────────────────────────────────────────────┘
-          Windows: Named Events (CreateEventW / SetEvent / WaitForSingleObject)
-          Linux:   eventfd (planned)
-```
-
-### Slot State Machine
-
-Each slot transitions through four states using `AtomicU32` compare-and-swap:
-
-```
-    Hub writes request           Worker CAS            Worker writes response       Hub CAS
-         into slot              Ready → Claimed             into slot             Done → Free
-            │                       │                          │                      │
-            ▼                       ▼                          ▼                      ▼
-  ┌──────┐      ┌───────┐      ┌─────────┐      ┌──────┐      ┌──────┐
-  │ Free │ ───► │ Ready │ ───► │ Claimed │ ───► │ Done │ ───► │ Free │
-  └──────┘      └───────┘      └─────────┘      └──────┘      └──────┘
-     0              1               2               3             0
-
-  Free (0)    — Slot is available for a new request
-  Ready (1)   — Hub has written request data; worker may claim it
-  Claimed (2) — Worker is processing the request
-  Done (3)    — Worker has written response data; hub may read it
-```
-
-No mutexes. No spinlocks. Just atomic CAS with `Acquire`/`Release` ordering to ensure memory visibility across processes.
+- **Microservice communication on a single host** — replace localhost HTTP between co-located services with shared memory IPC
+- **Sidecar architectures** — connect main processes to sidecars (auth, logging, metrics) without network overhead
+- **Plugin systems** — let plugins run in separate processes with near-zero communication cost
+- **AI/ML inference** — dispatch requests to GPU worker processes with minimal latency
+- **Game servers** — fast IPC between game logic, physics, and networking processes
+- **Desktop applications** — communicate between a UI process and background workers
 
 ## Quick Start
 
@@ -164,82 +99,9 @@ worker.start_receive_loop(|transport, slot_index, request| {
 });
 ```
 
-## How It Works
-
-### Request lifecycle
-
-1. **Hub** finds a free slot (linear scan, typically slot 0 or 1 for low-traffic workloads).
-2. **Hub** bump-allocates space on the inline heap for serialized `RequestMeta` (path, headers, query params) and the request body.
-3. **Hub** writes metadata pointers and body pointers into the slot's fixed-size fields (128 bytes per slot).
-4. **Hub** atomically sets the slot status from `Free` to `Ready` with `Release` ordering.
-5. **Hub** signals the request event — the worker wakes up in under 1 microsecond.
-6. **Worker** scans slots, finds the `Ready` one, and CAS transitions it to `Claimed`.
-7. **Worker** reads request data from the heap using the slot's offset/length pointers.
-8. **Worker** processes the request, writes the response into the heap (or an overflow region), and sets the slot to `Done`.
-9. **Worker** signals the response event — the hub wakes up.
-10. **Hub** reads the response, resolves the oneshot channel, and CAS transitions the slot back to `Free`.
-
-### Inline heap + overflow
-
-The control region contains a bump-allocated heap after the header and slots. Small payloads (metadata, typical JSON bodies) are written inline — no extra allocations, no extra shared memory regions.
-
-When the heap is full, large payloads spill to **overflow regions**: temporary named shared memory mappings (`slotbus-{name}-req-{slot}` or `slotbus-{name}-rsp-{slot}`). These are created on demand and kept alive until the slot is freed.
-
-The heap resets automatically when all slots return to `Free` — no fragmentation, no GC.
-
-### Serialization
-
-Metadata is serialized with [postcard](https://crates.io/crates/postcard), a compact binary format. Request and response bodies are raw bytes — slotbus does not impose a serialization format on your payloads.
-
-### Event signaling
-
-Each worker has two OS-level named events:
-- **Request event** (`slotbus-{name}-req`): hub signals after writing a `Ready` slot
-- **Response event** (`slotbus-{name}-rsp`): worker signals after writing a `Done` slot
-
-Events are auto-reset: a single `WaitForSingleObject` call blocks until signaled, then automatically resets. No polling loops, no busy-waiting, no timer ticks. The 5-second timeout in the wait call is a safety fallback — under normal operation, the event fires in under 1 microsecond.
-
-On Windows, these are [Named Events](https://learn.microsoft.com/en-us/windows/win32/sync/event-objects) via `CreateEventW` / `SetEvent` / `WaitForSingleObject`. Linux support via `eventfd` is planned.
-
-## Configuration
-
-All options are set through the builder:
-
-```rust
-let config = SlotBusConfig::builder()
-    .name("my-worker")        // Required. OS identifier for the SHM region.
-    .prefix("slotbus")        // Prefix for all OS names. Default: "slotbus".
-    .num_slots(32)             // Concurrent request slots. Default: 32. Range: 1-256.
-    .region_size(1_048_576)    // Control region size in bytes. Default: 1MB.
-    .wait_timeout_ms(5_000)    // Event wait timeout (safety fallback). Default: 5000ms.
-    .instrumentation(false)    // Latency logging. Default: false.
-    .build();
-```
-
-| Option | Default | Description |
-|---|---|---|
-| `name` | *required* | Worker name. Used to derive all OS-level identifiers: `{prefix}-{name}` for the SHM region, `{prefix}-{name}-req` / `{prefix}-{name}-rsp` for events. |
-| `prefix` | `"slotbus"` | Namespace prefix. Change this to run multiple independent slotbus instances on the same machine. |
-| `num_slots` | `32` | Number of concurrent request/response slots. Each slot is 128 bytes of fixed metadata. More slots = more concurrency, but the heap shrinks. Clamped to 1-256. |
-| `region_size` | `1,048,576` | Total size of the control region in bytes. Must fit the header (64B) + slots (128B each) + heap. With 32 slots, the heap gets ~1,044,416 bytes. |
-| `wait_timeout_ms` | `5,000` | Maximum time (ms) to block on an event wait. Safety fallback only — the event signal provides sub-microsecond wakeup. |
-| `instrumentation` | `false` | When enabled, logs timing data for slot claims, round-trips, and heap allocations via `tracing`. |
-
-### Derived OS names
-
-For a worker named `"my-worker"` with the default prefix:
-
-| Resource | OS Name |
-|---|---|
-| Control region | `slotbus-my-worker` |
-| Request event | `slotbus-my-worker-req` |
-| Response event | `slotbus-my-worker-rsp` |
-| Request overflow (slot 5) | `slotbus-my-worker-req-5` |
-| Response overflow (slot 5) | `slotbus-my-worker-rsp-5` |
-
 ## slotbus-hub
 
-[`slotbus-hub`](https://github.com/JustMaier/slotbus-hub) is a standalone HTTP-to-SHM router binary built on slotbus. Workers register routes via HTTP; clients send normal HTTP requests; the hub dispatches them through shared memory with sub-millisecond round trips.
+Need an HTTP gateway? [`slotbus-hub`](https://github.com/JustMaier/slotbus-hub) is a standalone HTTP-to-shared-memory router. Workers register routes via HTTP; clients send normal HTTP requests; the hub dispatches them through shared memory with sub-millisecond round trips.
 
 Install it separately: `cargo install slotbus-hub` — see the [slotbus-hub repo](https://github.com/JustMaier/slotbus-hub) for full documentation.
 
@@ -272,7 +134,6 @@ Install it separately: `cargo install slotbus-hub` — see the [slotbus-hub repo
 - Cross-machine communication (use gRPC or HTTP)
 - Pure streaming / pub-sub (use iceoryx2 or ZeroMQ)
 - Single-producer single-consumer with maximum throughput (use shmem-ipc ring buffers)
-- You need a non-Windows platform (slotbus supports Windows, Linux, and macOS)
 
 ## Platform Support
 
@@ -284,9 +145,161 @@ Install it separately: `cargo install slotbus-hub` — see the [slotbus-hub repo
 
 The shared memory layer uses the [`shared_memory`](https://crates.io/crates/shared_memory) crate, which supports all three platforms. The signaling layer uses platform-native primitives for sub-microsecond wake latency on Windows and Linux. macOS uses a polling fallback (~1ms resolution) since `sem_timedwait` is not available.
 
-## Minimum Supported Rust Version
+---
 
-1.75
+<details>
+<summary><strong>Architecture & Internals</strong></summary>
+
+### Shared Memory Layout
+
+```
+                         Hub Process                              Worker Process
+                    ┌─────────────────────┐                  ┌─────────────────────┐
+                    │     SlotBus          │                  │    SlotWorker        │
+                    │  (hub-side handle)   │                  │  (worker-side handle)│
+                    └────────┬────────────┘                  └────────┬─────────────┘
+                             │                                        │
+                   dispatch_request()                       start_receive_loop()
+                             │                                        │
+          ┌──────────────────▼────────────────────────────────────────▼───────────┐
+          │                    Shared Memory Control Region (1 MB)                │
+          │                                                                      │
+          │  ┌────────────────────────────────────────────────────────────────┐   │
+          │  │  Header (64 bytes)                                            │   │
+          │  │  magic: 0x48554231 | version: 1 | num_slots: 32              │   │
+          │  │  heap_offset | heap_size | alloc_head (AtomicU32)             │   │
+          │  └────────────────────────────────────────────────────────────────┘   │
+          │                                                                      │
+          │  ┌──────────┐ ┌──────────┐ ┌──────────┐         ┌──────────┐        │
+          │  │  Slot 0  │ │  Slot 1  │ │  Slot 2  │  . . .  │  Slot 31 │        │
+          │  │ 128 bytes│ │ 128 bytes│ │ 128 bytes│         │ 128 bytes│        │
+          │  │          │ │          │ │          │         │          │        │
+          │  │ status   │ │ status   │ │ status   │         │ status   │        │
+          │  │ req_id   │ │ req_id   │ │ req_id   │         │ req_id   │        │
+          │  │ method   │ │ method   │ │ method   │         │ method   │        │
+          │  │ meta_ptr │ │ meta_ptr │ │ meta_ptr │         │ meta_ptr │        │
+          │  │ body_ptr │ │ body_ptr │ │ body_ptr │         │ body_ptr │        │
+          │  │ resp_ptr │ │ resp_ptr │ │ resp_ptr │         │ resp_ptr │        │
+          │  └──────────┘ └──────────┘ └──────────┘         └──────────┘        │
+          │                                                                      │
+          │  ┌────────────────────────────────────────────────────────────────┐   │
+          │  │  Inline Heap (~1MB - header - slots)                          │   │
+          │  │  Bump-allocated. Metadata and small bodies written here.      │   │
+          │  │  CAS on alloc_head for thread-safe allocation.                │   │
+          │  │  Auto-reset when all slots are Free.                          │   │
+          │  └────────────────────────────────────────────────────────────────┘   │
+          └──────────────────────────────────────────────────────────────────────┘
+
+          ┌──────────────────────────────────────────────────────────────────┐
+          │  Overflow Regions (temporary, per-slot, created on demand)       │
+          │  slotbus-{name}-req-{slot}  — large request bodies              │
+          │  slotbus-{name}-rsp-{slot}  — large response bodies             │
+          └──────────────────────────────────────────────────────────────────┘
+
+          Signaling (zero-polling cross-process wakeup):
+          ┌─────────────────────────────────────────────┐
+          │  slotbus-{name}-req  ──►  wake worker       │   Hub signals after writing Ready slot
+          │  slotbus-{name}-rsp  ──►  wake hub          │   Worker signals after writing Done slot
+          └─────────────────────────────────────────────┘
+          Windows: Named Events (CreateEventW / SetEvent / WaitForSingleObject)
+          Linux:   POSIX named semaphores
+```
+
+### Slot State Machine
+
+Each slot transitions through four states using `AtomicU32` compare-and-swap:
+
+```
+    Hub writes request           Worker CAS            Worker writes response       Hub CAS
+         into slot              Ready → Claimed             into slot             Done → Free
+            │                       │                          │                      │
+            ▼                       ▼                          ▼                      ▼
+  ┌──────┐      ┌───────┐      ┌─────────┐      ┌──────┐      ┌──────┐
+  │ Free │ ───► │ Ready │ ───► │ Claimed │ ───► │ Done │ ───► │ Free │
+  └──────┘      └───────┘      └─────────┘      └──────┘      └──────┘
+     0              1               2               3             0
+
+  Free (0)    — Slot is available for a new request
+  Ready (1)   — Hub has written request data; worker may claim it
+  Claimed (2) — Worker is processing the request
+  Done (3)    — Worker has written response data; hub may read it
+```
+
+No mutexes. No spinlocks. Just atomic CAS with `Acquire`/`Release` ordering to ensure memory visibility across processes.
+
+### Request Lifecycle
+
+1. **Hub** finds a free slot (linear scan, typically slot 0 or 1 for low-traffic workloads).
+2. **Hub** bump-allocates space on the inline heap for serialized `RequestMeta` (path, headers, query params) and the request body.
+3. **Hub** writes metadata pointers and body pointers into the slot's fixed-size fields (128 bytes per slot).
+4. **Hub** atomically sets the slot status from `Free` to `Ready` with `Release` ordering.
+5. **Hub** signals the request event — the worker wakes up in under 1 microsecond.
+6. **Worker** scans slots, finds the `Ready` one, and CAS transitions it to `Claimed`.
+7. **Worker** reads request data from the heap using the slot's offset/length pointers.
+8. **Worker** processes the request, writes the response into the heap (or an overflow region), and sets the slot to `Done`.
+9. **Worker** signals the response event — the hub wakes up.
+10. **Hub** reads the response, resolves the oneshot channel, and CAS transitions the slot back to `Free`.
+
+### Inline Heap + Overflow
+
+The control region contains a bump-allocated heap after the header and slots. Small payloads (metadata, typical JSON bodies) are written inline — no extra allocations, no extra shared memory regions.
+
+When the heap is full, large payloads spill to **overflow regions**: temporary named shared memory mappings (`slotbus-{name}-req-{slot}` or `slotbus-{name}-rsp-{slot}`). These are created on demand and kept alive until the slot is freed.
+
+The heap resets automatically when all slots return to `Free` — no fragmentation, no GC.
+
+### Serialization
+
+Metadata is serialized with [postcard](https://crates.io/crates/postcard), a compact binary format. Request and response bodies are raw bytes — slotbus does not impose a serialization format on your payloads.
+
+### Event Signaling
+
+Each worker has two OS-level named events:
+- **Request event** (`slotbus-{name}-req`): hub signals after writing a `Ready` slot
+- **Response event** (`slotbus-{name}-rsp`): worker signals after writing a `Done` slot
+
+Events are auto-reset: a single `WaitForSingleObject` call blocks until signaled, then automatically resets. No polling loops, no busy-waiting, no timer ticks. The 5-second timeout in the wait call is a safety fallback — under normal operation, the event fires in under 1 microsecond.
+
+</details>
+
+<details>
+<summary><strong>Configuration Reference</strong></summary>
+
+All options are set through the builder:
+
+```rust
+let config = SlotBusConfig::builder()
+    .name("my-worker")        // Required. OS identifier for the SHM region.
+    .prefix("slotbus")        // Prefix for all OS names. Default: "slotbus".
+    .num_slots(32)             // Concurrent request slots. Default: 32. Range: 1-256.
+    .region_size(1_048_576)    // Control region size in bytes. Default: 1MB.
+    .wait_timeout_ms(5_000)    // Event wait timeout (safety fallback). Default: 5000ms.
+    .instrumentation(false)    // Latency logging. Default: false.
+    .build();
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `name` | *required* | Worker name. Used to derive all OS-level identifiers: `{prefix}-{name}` for the SHM region, `{prefix}-{name}-req` / `{prefix}-{name}-rsp` for events. |
+| `prefix` | `"slotbus"` | Namespace prefix. Change this to run multiple independent slotbus instances on the same machine. |
+| `num_slots` | `32` | Number of concurrent request/response slots. Each slot is 128 bytes of fixed metadata. More slots = more concurrency, but the heap shrinks. Clamped to 1-256. |
+| `region_size` | `1,048,576` | Total size of the control region in bytes. Must fit the header (64B) + slots (128B each) + heap. With 32 slots, the heap gets ~1,044,416 bytes. |
+| `wait_timeout_ms` | `5,000` | Maximum time (ms) to block on an event wait. Safety fallback only — the event signal provides sub-microsecond wakeup. |
+| `instrumentation` | `false` | When enabled, logs timing data for slot claims, round-trips, and heap allocations via `tracing`. |
+
+### Derived OS Names
+
+For a worker named `"my-worker"` with the default prefix:
+
+| Resource | OS Name |
+|---|---|
+| Control region | `slotbus-my-worker` |
+| Request event | `slotbus-my-worker-req` |
+| Response event | `slotbus-my-worker-rsp` |
+| Request overflow (slot 5) | `slotbus-my-worker-req-5` |
+| Response overflow (slot 5) | `slotbus-my-worker-rsp-5` |
+
+</details>
 
 ## Contributing
 
@@ -306,6 +319,10 @@ RUST_LOG=slotbus=trace cargo test
 ```
 
 The codebase is small by design. The core transport is under 1,000 lines.
+
+## Minimum Supported Rust Version
+
+1.75
 
 ## License
 
