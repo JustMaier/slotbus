@@ -1,0 +1,25 @@
+[package]
+name = "slotbus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+categories.workspace = true
+keywords.workspace = true
+description = "Lock-free shared memory IPC with slotted request/response. Sub-microsecond wake latency, zero-copy payloads, 32 concurrent in-flight requests per worker."
+readme = "../README.md"
+
+[dependencies]
+shared_memory = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = { workspace = true }

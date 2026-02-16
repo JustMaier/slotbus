@@ -1,0 +1,24 @@
+[workspace]
+members = ["slotbus", "slotbus-hub"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Justin Zipperle"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jzipperle/slotbus"
+homepage = "https://github.com/jzipperle/slotbus"
+categories = ["network-programming", "concurrency", "os"]
+keywords = ["ipc", "shared-memory", "lock-free", "rpc", "low-latency"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+postcard = { version = "1", features = ["alloc"] }
+shared_memory = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
