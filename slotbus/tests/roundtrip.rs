@@ -261,14 +261,16 @@ async fn request_metadata_preserved() {
     let (bus, worker) = create_pair("metadata", 4);
     bus.start_response_watcher();
 
-    worker.clone().start_receive_loop(move |w, slot, req: Request| {
-        let info = format!(
-            "method={} path={} route={} params={:?} query={:?}",
-            req.method, req.path, req.route_pattern, req.path_params, req.query,
-        );
-        w.send_response(slot, 200, info.into_bytes(), "text/plain", vec![])
-            .unwrap();
-    });
+    worker
+        .clone()
+        .start_receive_loop(move |w, slot, req: Request| {
+            let info = format!(
+                "method={} path={} route={} params={:?} query={:?}",
+                req.method, req.path, req.route_pattern, req.path_params, req.query,
+            );
+            w.send_response(slot, 200, info.into_bytes(), "text/plain", vec![])
+                .unwrap();
+        });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -307,18 +309,20 @@ async fn async_work_in_handler() {
     // to spawn async work back onto the runtime.
     let rt_handle = tokio::runtime::Handle::current();
 
-    worker.clone().start_receive_loop(move |w, slot, req: Request| {
-        let w = Arc::clone(&w);
+    worker
+        .clone()
+        .start_receive_loop(move |w, slot, req: Request| {
+            let w = Arc::clone(&w);
 
-        rt_handle.spawn(async move {
-            // Simulate async processing.
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            rt_handle.spawn(async move {
+                // Simulate async processing.
+                tokio::time::sleep(Duration::from_millis(5)).await;
 
-            let body = format!("async response for {}", req.path);
-            w.send_response(slot, 200, body.into_bytes(), "text/plain", vec![])
-                .unwrap();
+                let body = format!("async response for {}", req.path);
+                w.send_response(slot, 200, body.into_bytes(), "text/plain", vec![])
+                    .unwrap();
+            });
         });
-    });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 

@@ -1,3 +1,42 @@
+/// macOS limits POSIX named semaphore and shared memory names to 31 characters
+/// (including the leading `/` that the OS prepends). When names exceed this,
+/// we hash them to a fixed-length string.
+#[cfg(target_os = "macos")]
+fn sanitize_os_name(name: &str) -> String {
+    // With leading `/`, the total must be <= 31 chars, so name itself <= 30 chars.
+    // shm_open on macOS also has this same limit (PSHMNAMLEN = 31).
+    if name.len() <= 30 {
+        return name.to_string();
+    }
+    // FNV-1a 64-bit hash, encoded as 11 base62 chars
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in name.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    const CHARS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut encoded = String::with_capacity(11);
+    let mut h = hash;
+    for _ in 0..11 {
+        encoded.push(CHARS[(h % 62) as usize] as char);
+        h /= 62;
+    }
+    // "sb-" (3) + 11 hash chars = 14 chars, leaving 16 for suffix
+    let suffix_len = 16.min(name.len());
+    let suffix = &name[name.len() - suffix_len..];
+    let result = format!("sb-{encoded}{suffix}");
+    if result.len() > 30 {
+        format!("sb-{encoded}")
+    } else {
+        result
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sanitize_os_name(name: &str) -> String {
+    name.to_string()
+}
+
 /// Configuration for a slotbus shared memory region.
 ///
 /// Use the builder pattern to customize behavior:
@@ -59,27 +98,27 @@ impl SlotBusConfig {
 
     /// The full OS-level name for the control region.
     pub fn region_name(&self) -> String {
-        format!("{}-{}", self.prefix, self.name)
+        sanitize_os_name(&format!("{}-{}", self.prefix, self.name))
     }
 
     /// The OS-level name for the request event.
     pub fn request_event_name(&self) -> String {
-        format!("{}-{}-req", self.prefix, self.name)
+        sanitize_os_name(&format!("{}-{}-req", self.prefix, self.name))
     }
 
     /// The OS-level name for the response event.
     pub fn response_event_name(&self) -> String {
-        format!("{}-{}-rsp", self.prefix, self.name)
+        sanitize_os_name(&format!("{}-{}-rsp", self.prefix, self.name))
     }
 
     /// The OS-level name for a request overflow region at a given slot.
     pub fn request_overflow_name(&self, slot: usize) -> String {
-        format!("{}-{}-req-{}", self.prefix, self.name, slot)
+        sanitize_os_name(&format!("{}-{}-req-{}", self.prefix, self.name, slot))
     }
 
     /// The OS-level name for a response overflow region at a given slot.
     pub fn response_overflow_name(&self, slot: usize) -> String {
-        format!("{}-{}-rsp-{}", self.prefix, self.name, slot)
+        sanitize_os_name(&format!("{}-{}-rsp-{}", self.prefix, self.name, slot))
     }
 }
 
