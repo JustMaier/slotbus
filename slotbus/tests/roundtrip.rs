@@ -57,10 +57,12 @@ async fn single_request_response() {
     let (bus, worker) = create_pair("single", 4);
     bus.start_response_watcher();
 
-    worker.clone().start_receive_loop(move |w, slot, req: Request| {
-        w.send_response(slot, 200, req.body, "text/plain", vec![])
-            .unwrap();
-    });
+    worker
+        .clone()
+        .start_receive_loop(move |w, slot, req: Request| {
+            w.send_response(slot, 200, req.body, "text/plain", vec![])
+                .unwrap();
+        });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -84,11 +86,13 @@ async fn sequential_requests() {
     let (bus, worker) = create_pair("sequential", 4);
     bus.start_response_watcher();
 
-    worker.clone().start_receive_loop(move |w, slot, req: Request| {
-        let body = req.path.into_bytes();
-        w.send_response(slot, 200, body, "text/plain", vec![])
-            .unwrap();
-    });
+    worker
+        .clone()
+        .start_receive_loop(move |w, slot, req: Request| {
+            let body = req.path.into_bytes();
+            w.send_response(slot, 200, body, "text/plain", vec![])
+                .unwrap();
+        });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -116,13 +120,15 @@ async fn concurrent_responses() {
     let (bus, worker) = create_pair("concurrent", 32);
     bus.start_response_watcher();
 
-    worker.clone().start_receive_loop(move |w, slot, req: Request| {
-        let mut resp = req.req_id.into_bytes();
-        resp.push(b':');
-        resp.extend_from_slice(&req.body);
-        w.send_response(slot, 200, resp, "application/octet-stream", vec![])
-            .unwrap();
-    });
+    worker
+        .clone()
+        .start_receive_loop(move |w, slot, req: Request| {
+            let mut resp = req.req_id.into_bytes();
+            resp.push(b':');
+            resp.extend_from_slice(&req.body);
+            w.send_response(slot, 200, resp, "application/octet-stream", vec![])
+                .unwrap();
+        });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -169,11 +175,13 @@ async fn empty_body() {
     let (bus, worker) = create_pair("empty-body", 4);
     bus.start_response_watcher();
 
-    worker.clone().start_receive_loop(move |w, slot, req: Request| {
-        assert!(req.body.is_empty());
-        w.send_response(slot, 204, vec![], "text/plain", vec![])
-            .unwrap();
-    });
+    worker
+        .clone()
+        .start_receive_loop(move |w, slot, req: Request| {
+            assert!(req.body.is_empty());
+            w.send_response(slot, 204, vec![], "text/plain", vec![])
+                .unwrap();
+        });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -196,10 +204,12 @@ async fn large_body_overflow() {
     let (bus, worker) = create_pair("overflow", 4);
     bus.start_response_watcher();
 
-    worker.clone().start_receive_loop(move |w, slot, req: Request| {
-        w.send_response(slot, 200, req.body, "application/octet-stream", vec![])
-            .unwrap();
-    });
+    worker
+        .clone()
+        .start_receive_loop(move |w, slot, req: Request| {
+            w.send_response(slot, 200, req.body, "application/octet-stream", vec![])
+                .unwrap();
+        });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -226,15 +236,17 @@ async fn response_headers_and_content_type() {
     let (bus, worker) = create_pair("headers", 4);
     bus.start_response_watcher();
 
-    worker.clone().start_receive_loop(move |w, slot, _req: Request| {
-        let body = br#"{"ok": true}"#.to_vec();
-        let headers = vec![
-            ("x-request-id".into(), "test-123".into()),
-            ("x-custom".into(), "value".into()),
-        ];
-        w.send_response(slot, 201, body, "application/json", headers)
-            .unwrap();
-    });
+    worker
+        .clone()
+        .start_receive_loop(move |w, slot, _req: Request| {
+            let body = br#"{"ok": true}"#.to_vec();
+            let headers = vec![
+                ("x-request-id".into(), "test-123".into()),
+                ("x-custom".into(), "value".into()),
+            ];
+            w.send_response(slot, 201, body, "application/json", headers)
+                .unwrap();
+        });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 

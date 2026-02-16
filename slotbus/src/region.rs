@@ -347,7 +347,9 @@ pub fn write_request(
     let id_bytes = req_id.as_bytes();
     let id_len = id_bytes.len().min(36);
     unsafe {
-        let slot_ptr = region.as_ptr().add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
+        let slot_ptr = region
+            .as_ptr()
+            .add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
         let req_id_ptr = slot_ptr.add(4);
         std::ptr::write_bytes(req_id_ptr, 0, 36);
         std::ptr::copy_nonoverlapping(id_bytes.as_ptr(), req_id_ptr, id_len);
@@ -364,7 +366,9 @@ pub fn write_request(
 
     // Write meta pointer fields
     unsafe {
-        let slot_ptr = region.as_ptr().add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
+        let slot_ptr = region
+            .as_ptr()
+            .add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
         (slot_ptr.add(44) as *mut u32).write(meta_offset);
         (slot_ptr.add(48) as *mut u16).write(meta_bytes.len() as u16);
     }
@@ -373,7 +377,9 @@ pub fn write_request(
     let mut overflow_region = None;
     if body.is_empty() {
         unsafe {
-            let slot_ptr = region.as_ptr().add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
+            let slot_ptr = region
+                .as_ptr()
+                .add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
             (slot_ptr.add(52) as *mut u32).write(0);
             (slot_ptr.add(56) as *mut u32).write(0);
             slot_ptr.add(60).write(0);
@@ -381,7 +387,9 @@ pub fn write_request(
     } else if let Some(body_offset) = region.alloc_heap(body.len()) {
         unsafe {
             region.heap_write(body_offset, body);
-            let slot_ptr = region.as_ptr().add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
+            let slot_ptr = region
+                .as_ptr()
+                .add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
             (slot_ptr.add(52) as *mut u32).write(body_offset);
             (slot_ptr.add(56) as *mut u32).write(body.len() as u32);
             slot_ptr.add(60).write(0);
@@ -390,7 +398,9 @@ pub fn write_request(
         let name = config.request_overflow_name(slot_index);
         let ovf = ShmRegion::create_overflow(&name, body)?;
         unsafe {
-            let slot_ptr = region.as_ptr().add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
+            let slot_ptr = region
+                .as_ptr()
+                .add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
             (slot_ptr.add(52) as *mut u32).write(0);
             (slot_ptr.add(56) as *mut u32).write(body.len() as u32);
             slot_ptr.add(60).write(1);
@@ -419,7 +429,9 @@ pub fn write_response(
 
     // Write resp_status
     unsafe {
-        let slot_ptr = region.as_ptr().add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
+        let slot_ptr = region
+            .as_ptr()
+            .add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
         (slot_ptr.add(64) as *mut u16).write(status);
     }
 
@@ -432,7 +444,9 @@ pub fn write_response(
     }
 
     unsafe {
-        let slot_ptr = region.as_ptr().add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
+        let slot_ptr = region
+            .as_ptr()
+            .add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
         (slot_ptr.add(68) as *mut u32).write(meta_offset);
         (slot_ptr.add(72) as *mut u16).write(meta_bytes.len() as u16);
     }
@@ -441,7 +455,9 @@ pub fn write_response(
     let mut overflow_region = None;
     if body.is_empty() {
         unsafe {
-            let slot_ptr = region.as_ptr().add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
+            let slot_ptr = region
+                .as_ptr()
+                .add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
             (slot_ptr.add(76) as *mut u32).write(0);
             (slot_ptr.add(80) as *mut u32).write(0);
             slot_ptr.add(84).write(0);
@@ -449,7 +465,9 @@ pub fn write_response(
     } else if let Some(body_offset) = region.alloc_heap(body.len()) {
         unsafe {
             region.heap_write(body_offset, body);
-            let slot_ptr = region.as_ptr().add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
+            let slot_ptr = region
+                .as_ptr()
+                .add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
             (slot_ptr.add(76) as *mut u32).write(body_offset);
             (slot_ptr.add(80) as *mut u32).write(body.len() as u32);
             slot_ptr.add(84).write(0);
@@ -458,7 +476,9 @@ pub fn write_response(
         let name = config.response_overflow_name(slot_index);
         let ovf = ShmRegion::create_overflow(&name, body)?;
         unsafe {
-            let slot_ptr = region.as_ptr().add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
+            let slot_ptr = region
+                .as_ptr()
+                .add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
             (slot_ptr.add(76) as *mut u32).write(0);
             (slot_ptr.add(80) as *mut u32).write(body.len() as u32);
             slot_ptr.add(84).write(1);

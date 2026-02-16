@@ -84,8 +84,14 @@ impl NamedEvent {
             unsafe {
                 libc::sem_unlink(cname.as_ptr());
             }
-            let sem =
-                unsafe { libc::sem_open(cname.as_ptr(), libc::O_CREAT, 0o644 as libc::mode_t, 0) };
+            let sem = unsafe {
+                libc::sem_open(
+                    cname.as_ptr(),
+                    libc::O_CREAT,
+                    0o644 as libc::c_uint,
+                    0 as libc::c_uint,
+                )
+            };
             if sem == libc::SEM_FAILED {
                 let errno = std::io::Error::last_os_error();
                 return Err(SlotBusError::Event(format!(
@@ -105,8 +111,7 @@ impl NamedEvent {
         #[cfg(windows)]
         {
             let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-            let handle =
-                unsafe { OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZE, 0, wide.as_ptr()) };
+            let handle = unsafe { OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZE, 0, wide.as_ptr()) };
             if handle == 0 {
                 return Err(SlotBusError::Event(format!(
                     "OpenEventW failed for '{name}'"

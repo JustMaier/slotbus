@@ -195,79 +195,79 @@ impl SlotBus {
         std::thread::Builder::new()
             .name(format!("{}-slotbus-rsp", config.name))
             .spawn(move || {
-            loop {
-                if !running.load(Ordering::Relaxed) {
-                    break;
-                }
-                rsp_event.wait_timeout(config.wait_timeout_ms);
-
-                let mut freed_any = false;
-
-                for i in 0..region.num_slots() {
-                    let slot = unsafe { region.slot(i) };
-
-                    // Check if this slot has a completed response.
-                    if slot.status.load(Ordering::Acquire) != SLOT_DONE {
-                        continue;
+                loop {
+                    if !running.load(Ordering::Relaxed) {
+                        break;
                     }
+                    rsp_event.wait_timeout(config.wait_timeout_ms);
 
-                    // Read req_id and response data BEFORE transitioning to Free.
-                    // Once the slot is Free, a concurrent dispatch can overwrite
-                    // the req_id and heap data.
-                    let req_id = {
-                        let raw = &slot.req_id;
-                        let end = raw.iter().position(|&b| b == 0).unwrap_or(36);
-                        String::from_utf8_lossy(&raw[..end]).to_string()
-                    };
-                    let resp_result = region::read_response(&region, i, &config);
+                    let mut freed_any = false;
 
-                    // Now transition Done → Free. Since we're the only thread
-                    // doing this transition, the CAS should always succeed.
-                    if slot
-                        .status
-                        .compare_exchange(
-                            SLOT_DONE,
-                            SLOT_FREE,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_err()
-                    {
-                        continue;
-                    }
+                    for i in 0..region.num_slots() {
+                        let slot = unsafe { region.slot(i) };
 
-                    freed_any = true;
-                    overflow_regions.lock().unwrap().remove(&i);
+                        // Check if this slot has a completed response.
+                        if slot.status.load(Ordering::Acquire) != SLOT_DONE {
+                            continue;
+                        }
 
-                    match resp_result {
-                        Ok((status, meta, body)) => {
-                            if let Some((t0, label, tx)) =
-                                pending.lock().unwrap().remove(&req_id)
-                            {
-                                if config.instrumentation {
-                                    let rtt_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                                    debug!("{label} → {status} ({rtt_ms:.1}ms)");
+                        // Read req_id and response data BEFORE transitioning to Free.
+                        // Once the slot is Free, a concurrent dispatch can overwrite
+                        // the req_id and heap data.
+                        let req_id = {
+                            let raw = &slot.req_id;
+                            let end = raw.iter().position(|&b| b == 0).unwrap_or(36);
+                            String::from_utf8_lossy(&raw[..end]).to_string()
+                        };
+                        let resp_result = region::read_response(&region, i, &config);
+
+                        // Now transition Done → Free. Since we're the only thread
+                        // doing this transition, the CAS should always succeed.
+                        if slot
+                            .status
+                            .compare_exchange(
+                                SLOT_DONE,
+                                SLOT_FREE,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_err()
+                        {
+                            continue;
+                        }
+
+                        freed_any = true;
+                        overflow_regions.lock().unwrap().remove(&i);
+
+                        match resp_result {
+                            Ok((status, meta, body)) => {
+                                if let Some((t0, label, tx)) =
+                                    pending.lock().unwrap().remove(&req_id)
+                                {
+                                    if config.instrumentation {
+                                        let rtt_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                        debug!("{label} → {status} ({rtt_ms:.1}ms)");
+                                    }
+                                    let _ = tx.send(Response {
+                                        status,
+                                        body,
+                                        content_type: meta.content_type,
+                                        headers: meta.headers,
+                                    });
                                 }
-                                let _ = tx.send(Response {
-                                    status,
-                                    body,
-                                    content_type: meta.content_type,
-                                    headers: meta.headers,
-                                });
+                            }
+                            Err(e) => {
+                                warn!(slot = i, error = %e, "failed to read response");
                             }
                         }
-                        Err(e) => {
-                            warn!(slot = i, error = %e, "failed to read response");
-                        }
+                    }
+
+                    if freed_any {
+                        region.try_reset_heap();
                     }
                 }
-
-                if freed_any {
-                    region.try_reset_heap();
-                }
-            }
-        })
-        .expect("failed to spawn slotbus response watcher thread")
+            })
+            .expect("failed to spawn slotbus response watcher thread")
     }
 
     /// Signal the response watcher and receive loops to stop.
@@ -403,10 +403,7 @@ impl SlotWorker {
     /// Calls `handler` for each incoming request. The handler receives
     /// `(Arc<SlotWorker>, slot_index, Request)` and must call
     /// [`send_response`](SlotWorker::send_response) when done.
-    pub fn start_receive_loop<F>(
-        self: Arc<Self>,
-        handler: F,
-    ) -> std::thread::JoinHandle<()>
+    pub fn start_receive_loop<F>(self: Arc<Self>, handler: F) -> std::thread::JoinHandle<()>
     where
         F: Fn(Arc<Self>, usize, Request) + Send + Sync + 'static,
     {
@@ -416,61 +413,59 @@ impl SlotWorker {
 
         std::thread::Builder::new()
             .name(format!("{}-slotbus-recv", self.config.name))
-            .spawn(move || {
-                loop {
-                    if !running.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    self.req_event.wait_timeout(self.config.wait_timeout_ms);
-                    let wake_time = Instant::now();
+            .spawn(move || loop {
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                self.req_event.wait_timeout(self.config.wait_timeout_ms);
+                let wake_time = Instant::now();
 
-                    for i in 0..self.region.num_slots() {
-                        let slot = unsafe { self.region.slot(i) };
+                for i in 0..self.region.num_slots() {
+                    let slot = unsafe { self.region.slot(i) };
 
-                        if slot
-                            .status
-                            .compare_exchange(
-                                SLOT_READY,
-                                SLOT_CLAIMED,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_ok()
-                        {
-                            match region::read_request(&self.region, i, &self.config) {
-                                Ok((req_id, method_u8, meta, body)) => {
-                                    let method_str = u8_to_method(method_u8);
+                    if slot
+                        .status
+                        .compare_exchange(
+                            SLOT_READY,
+                            SLOT_CLAIMED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        match region::read_request(&self.region, i, &self.config) {
+                            Ok((req_id, method_u8, meta, body)) => {
+                                let method_str = u8_to_method(method_u8);
 
-                                    if self.config.instrumentation {
-                                        let claim_us = wake_time.elapsed().as_micros();
-                                        debug!(
-                                            slot = i,
-                                            claim_us,
-                                            method = method_str,
-                                            path = %meta.path,
-                                            "claimed request"
-                                        );
-                                    }
-
-                                    let request = Request {
-                                        req_id,
-                                        method: method_str.to_string(),
-                                        path: meta.path,
-                                        route_pattern: meta.route_pattern,
-                                        path_params: meta.path_params.into_iter().collect(),
-                                        query: meta.query,
-                                        body,
-                                        headers: meta.headers.into_iter().collect(),
-                                    };
-
-                                    let transport = Arc::clone(&self);
-                                    let handler = Arc::clone(&handler);
-                                    handler(transport, i, request);
+                                if self.config.instrumentation {
+                                    let claim_us = wake_time.elapsed().as_micros();
+                                    debug!(
+                                        slot = i,
+                                        claim_us,
+                                        method = method_str,
+                                        path = %meta.path,
+                                        "claimed request"
+                                    );
                                 }
-                                Err(e) => {
-                                    warn!(slot = i, error = %e, "failed to read request");
-                                    slot.status.store(SLOT_FREE, Ordering::Release);
-                                }
+
+                                let request = Request {
+                                    req_id,
+                                    method: method_str.to_string(),
+                                    path: meta.path,
+                                    route_pattern: meta.route_pattern,
+                                    path_params: meta.path_params.into_iter().collect(),
+                                    query: meta.query,
+                                    body,
+                                    headers: meta.headers.into_iter().collect(),
+                                };
+
+                                let transport = Arc::clone(&self);
+                                let handler = Arc::clone(&handler);
+                                handler(transport, i, request);
+                            }
+                            Err(e) => {
+                                warn!(slot = i, error = %e, "failed to read request");
+                                slot.status.store(SLOT_FREE, Ordering::Release);
                             }
                         }
                     }

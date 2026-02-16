@@ -30,13 +30,12 @@ fn main() {
         .init();
 
     // Build the config. The name must match what the hub created.
-    let config = SlotBusConfig::builder()
-        .name("echo")
-        .build();
+    let config = SlotBusConfig::builder().name("echo").build();
 
     // Open the existing shared memory region + events.
     // This will fail if no hub has created a region named "slotbus-echo" yet.
-    let worker = SlotWorker::open(config).expect("failed to open slotbus region — is the hub running?");
+    let worker =
+        SlotWorker::open(config).expect("failed to open slotbus region — is the hub running?");
     let worker = Arc::new(worker);
 
     println!("echo worker connected to slotbus region");
@@ -44,23 +43,25 @@ fn main() {
 
     // Start the blocking receive loop. The closure is called synchronously
     // on the receive thread for each incoming request.
-    let handle = worker.clone().start_receive_loop(move |w, slot, req: Request| {
-        println!(
-            "[slot {}] {} {} ({} bytes)",
-            slot,
-            req.method,
-            req.path,
-            req.body.len(),
-        );
+    let handle = worker
+        .clone()
+        .start_receive_loop(move |w, slot, req: Request| {
+            println!(
+                "[slot {}] {} {} ({} bytes)",
+                slot,
+                req.method,
+                req.path,
+                req.body.len(),
+            );
 
-        // Echo the request body back as the response.
-        let status = 200;
-        let body = req.body;
-        let content_type = "application/octet-stream";
+            // Echo the request body back as the response.
+            let status = 200;
+            let body = req.body;
+            let content_type = "application/octet-stream";
 
-        w.send_response(slot, status, body, content_type, vec![])
-            .expect("failed to send response");
-    });
+            w.send_response(slot, status, body, content_type, vec![])
+                .expect("failed to send response");
+        });
 
     // The receive loop runs forever. Join it so main doesn't exit.
     handle.join().expect("receive loop panicked");

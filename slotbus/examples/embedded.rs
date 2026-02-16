@@ -28,10 +28,7 @@ async fn main() {
     let name = format!("embedded-demo-{}", std::process::id());
 
     // ---- Hub side: create the shared memory region ----
-    let config = SlotBusConfig::builder()
-        .name(&name)
-        .num_slots(8)
-        .build();
+    let config = SlotBusConfig::builder().name(&name).num_slots(8).build();
 
     let bus = SlotBus::create(config).expect("failed to create slotbus region");
     println!("created slotbus region: {}", bus.region_name());
@@ -41,35 +38,34 @@ async fn main() {
     bus.start_response_watcher();
 
     // ---- Worker side: connect and start the receive loop ----
-    let worker_config = SlotBusConfig::builder()
-        .name(&name)
-        .num_slots(8)
-        .build();
+    let worker_config = SlotBusConfig::builder().name(&name).num_slots(8).build();
 
     let worker = SlotWorker::open(worker_config).expect("failed to open slotbus region");
     let worker = Arc::new(worker);
 
     // The receive loop handler runs synchronously on a dedicated OS thread.
     // For async work, capture a tokio runtime handle and spawn from inside.
-    worker.clone().start_receive_loop(move |w, slot, req: Request| {
-        // Simulate some "processing" — in a real worker this might be a
-        // database query, computation, or calling an external API.
-        let response_body = format!(
-            "Hello from embedded worker! You sent {} bytes to {} {}",
-            req.body.len(),
-            req.method,
-            req.path,
-        );
+    worker
+        .clone()
+        .start_receive_loop(move |w, slot, req: Request| {
+            // Simulate some "processing" — in a real worker this might be a
+            // database query, computation, or calling an external API.
+            let response_body = format!(
+                "Hello from embedded worker! You sent {} bytes to {} {}",
+                req.body.len(),
+                req.method,
+                req.path,
+            );
 
-        w.send_response(
-            slot,
-            200,
-            response_body.into_bytes(),
-            "text/plain",
-            vec![("x-worker".into(), "embedded".into())],
-        )
-        .expect("failed to send response");
-    });
+            w.send_response(
+                slot,
+                200,
+                response_body.into_bytes(),
+                "text/plain",
+                vec![("x-worker".into(), "embedded".into())],
+            )
+            .expect("failed to send response");
+        });
 
     // Give the worker thread a moment to start its event wait.
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
