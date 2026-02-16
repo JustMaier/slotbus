@@ -110,6 +110,15 @@ impl NamedEvent {
         }
     }
 
+    /// Get the raw OS event handle (Windows: `HANDLE` as `isize`).
+    ///
+    /// Useful for integrating with foreign event loops (e.g. libuv's `uv_poll_init`)
+    /// or FFI wrappers that need to expose the handle to other languages.
+    #[cfg(windows)]
+    pub fn raw_handle(&self) -> isize {
+        self.handle
+    }
+
     /// Wait for the event with a timeout in milliseconds.
     /// Returns `true` if the event was signaled, `false` on timeout.
     pub fn wait_timeout(&self, ms: u32) -> bool {
