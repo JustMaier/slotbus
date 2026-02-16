@@ -129,8 +129,11 @@ impl NamedEvent {
             unsafe { sem_unlink(cname.as_ptr()); }
             let sem = unsafe { sem_open(cname.as_ptr(), O_CREAT, 0o644, 0) };
             if sem == SEM_FAILED {
+                let errno = std::io::Error::last_os_error();
                 return Err(SlotBusError::Event(format!(
-                    "sem_open(create) failed for '{name}'"
+                    "sem_open(create) failed for '{}' (len {}): {errno}",
+                    cname.to_str().unwrap_or("?"),
+                    cname.to_bytes().len(),
                 )));
             }
             Ok(Self { sem, name: cname, created: true })
