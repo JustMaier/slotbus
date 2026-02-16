@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Extracted `slotbus-hub` binary into its own repo: [slotbus-hub](https://github.com/jzipperle/slotbus-hub)
+
 ## [0.1.0] - 2026-02-16
 
 ### Added
@@ -17,10 +21,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Inline heap with automatic overflow regions for variable-size payloads
 - Zero-copy payload access within shared memory regions
 - Postcard-based binary serialization for slot metadata
-- `slotbus-hub` standalone HTTP-to-SHM router binary
-- Worker registration with automatic route proxying
-- SSE event multiplexing across workers
-- Stale worker detection and cleanup on re-register
 
 [Unreleased]: https://github.com/jzipperle/slotbus/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/jzipperle/slotbus/releases/tag/v0.1.0

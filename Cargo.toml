@@ -1,5 +1,5 @@
 [workspace]
-members = ["slotbus", "slotbus-hub"]
+members = ["slotbus"]
 resolver = "2"
 
 [workspace.package]
@@ -16,7 +16,6 @@ keywords = ["ipc", "shared-memory", "lock-free", "rpc", "low-latency"]
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["full"] }
 postcard = { version = "1", features = ["alloc"] }
 shared_memory = "0.12"
 tracing = "0.1"
