@@ -2,10 +2,8 @@
 
 **Lock-free shared memory IPC for Rust.**
 
-[![Crates.io](https://img.shields.io/crates/v/slotbus.svg)](https://crates.io/crates/slotbus)
-[![docs.rs](https://img.shields.io/docsrs/slotbus)](https://docs.rs/slotbus)
 [![CI](https://github.com/JustMaier/slotbus/actions/workflows/ci.yml/badge.svg)](https://github.com/JustMaier/slotbus/actions/workflows/ci.yml)
-[![License](https://img.shields.io/crates/l/slotbus.svg)](LICENSE-MIT)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
 
 Slotbus provides slotted request/response communication between processes on the same machine. Instead of serializing data through HTTP or Unix sockets, processes read and write directly from shared memory pages with OS-level event signaling. The result is sub-microsecond wake latency and sub-millisecond round-trip times.
 
