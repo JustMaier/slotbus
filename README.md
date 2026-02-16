@@ -311,9 +311,4 @@ The codebase is small by design. The core transport is under 1,000 lines.
 
 ## License
 
-Licensed under either of
-
-- [Apache License, Version 2.0](LICENSE-APACHE)
-- [MIT License](LICENSE-MIT)
-
-at your option.
+Licensed under the [MIT License](LICENSE-MIT).
