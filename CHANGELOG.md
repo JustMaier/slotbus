@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Linux support via POSIX named semaphores (`sem_timedwait` — sub-microsecond wake)
+- macOS support via POSIX named semaphores (`sem_trywait` polling — ~1ms resolution)
+- FFI: `raw_handle()` on `NamedEvent` for Windows (exposes `HANDLE` as `isize`)
+
 ### Changed
 
 - Extracted `slotbus-hub` binary into its own repo: [slotbus-hub](https://github.com/JustMaier/slotbus-hub)

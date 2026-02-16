@@ -260,8 +260,8 @@ Install it separately: `cargo install slotbus-hub` — see the [slotbus-hub repo
 | **Route registration** | Dynamic (runtime) | N/A | framework | protobuf schema | N/A | topic-based |
 | **Overflow handling** | Auto spillover regions | N/A | chunked transfer | streaming | fixed buffer | loan mechanism |
 | **Windows** | Yes | Partial | Yes | Yes | No | Yes |
-| **Linux** | Planned | Yes | Yes | Yes | Yes | Yes |
-| **macOS** | Planned | Yes | Yes | Yes | Yes | Yes |
+| **Linux** | Yes | Yes | Yes | Yes | Yes | Yes |
+| **macOS** | Yes | Yes | Yes | Yes | Yes | Yes |
 
 **When to use slotbus:**
 - You need request/response semantics (not streaming or pub/sub)
@@ -274,17 +274,17 @@ Install it separately: `cargo install slotbus-hub` — see the [slotbus-hub repo
 - Cross-machine communication (use gRPC or HTTP)
 - Pure streaming / pub-sub (use iceoryx2 or ZeroMQ)
 - Single-producer single-consumer with maximum throughput (use shmem-ipc ring buffers)
-- You need Linux/macOS today (slotbus currently supports Windows; other platforms are planned)
+- You need a non-Windows platform (slotbus supports Windows, Linux, and macOS)
 
 ## Platform Support
 
 | Platform | Status | Signaling mechanism |
 |---|---|---|
 | **Windows** | Supported | Named Events (`CreateEventW` / `SetEvent` / `WaitForSingleObject`) |
-| **Linux** | Planned | `eventfd` |
-| **macOS** | Planned | `kqueue` + `eventfd` emulation via pipe |
+| **Linux** | Supported | POSIX named semaphores (`sem_open` / `sem_post` / `sem_timedwait`) |
+| **macOS** | Supported | POSIX named semaphores (`sem_open` / `sem_post` / `sem_trywait` polling) |
 
-The shared memory layer uses the [`shared_memory`](https://crates.io/crates/shared_memory) crate, which supports all three platforms. The signaling layer is the only platform-specific component.
+The shared memory layer uses the [`shared_memory`](https://crates.io/crates/shared_memory) crate, which supports all three platforms. The signaling layer uses platform-native primitives for sub-microsecond wake latency on Windows and Linux. macOS uses a polling fallback (~1ms resolution) since `sem_timedwait` is not available.
 
 ## Minimum Supported Rust Version
 

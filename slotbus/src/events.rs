@@ -7,10 +7,12 @@
 //! ## Platform support
 //!
 //! - **Windows**: Named Events via kernel32 (`CreateEventW`/`SetEvent`/`WaitForSingleObject`)
-//! - **Linux**: Not yet implemented (planned: `eventfd`)
-//! - **macOS**: Not yet implemented (planned: named semaphores)
+//! - **Linux**: POSIX named semaphores (`sem_open`/`sem_post`/`sem_timedwait`)
+//! - **macOS**: POSIX named semaphores (`sem_open`/`sem_post`/`sem_trywait` with polling)
 
 use crate::error::SlotBusError;
+
+// ---- Windows FFI ----
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -38,6 +40,46 @@ const SYNCHRONIZE: u32 = 0x0010_0000;
 #[cfg(windows)]
 const WAIT_OBJECT_0: u32 = 0;
 
+// ---- Unix FFI (POSIX named semaphores) ----
+
+#[cfg(unix)]
+type SemPtr = *mut std::ffi::c_void;
+
+#[cfg(unix)]
+const SEM_FAILED: SemPtr = !0usize as SemPtr;
+
+// O_CREAT differs between Linux and macOS
+#[cfg(target_os = "linux")]
+const O_CREAT: i32 = 0o100;
+#[cfg(target_os = "macos")]
+const O_CREAT: i32 = 0x0200;
+
+#[cfg(unix)]
+extern "C" {
+    fn sem_open(name: *const i8, oflag: i32, mode: u32, value: u32) -> SemPtr;
+    fn sem_close(sem: SemPtr) -> i32;
+    fn sem_unlink(name: *const i8) -> i32;
+    fn sem_post(sem: SemPtr) -> i32;
+    fn sem_trywait(sem: SemPtr) -> i32;
+}
+
+// Linux has sem_timedwait for efficient timed waits
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn sem_timedwait(sem: SemPtr, abs_timeout: *const Timespec) -> i32;
+    fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+const CLOCK_REALTIME: i32 = 0;
+
 /// Auto-reset named event for cross-process signaling.
 ///
 /// On signal, exactly one waiter is released (auto-reset behavior).
@@ -45,8 +87,12 @@ const WAIT_OBJECT_0: u32 = 0;
 pub struct NamedEvent {
     #[cfg(windows)]
     handle: isize,
-    #[cfg(not(windows))]
-    _phantom: (),
+    #[cfg(unix)]
+    sem: SemPtr,
+    #[cfg(unix)]
+    name: std::ffi::CString,
+    #[cfg(unix)]
+    created: bool,
 }
 
 impl NamedEvent {
@@ -70,12 +116,19 @@ impl NamedEvent {
             }
             Ok(Self { handle })
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
-            let _ = name;
-            Err(SlotBusError::Event(
-                "named events only supported on Windows (Linux/macOS planned)".into(),
-            ))
+            let cname = std::ffi::CString::new(format!("/{name}"))
+                .map_err(|e| SlotBusError::Event(format!("invalid name: {e}")))?;
+            // Remove stale semaphore from a previous crash (harmless if it doesn't exist)
+            unsafe { sem_unlink(cname.as_ptr()); }
+            let sem = unsafe { sem_open(cname.as_ptr(), O_CREAT, 0o644, 0) };
+            if sem == SEM_FAILED {
+                return Err(SlotBusError::Event(format!(
+                    "sem_open(create) failed for '{name}'"
+                )));
+            }
+            Ok(Self { sem, name: cname, created: true })
         }
     }
 
@@ -93,12 +146,18 @@ impl NamedEvent {
             }
             Ok(Self { handle })
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
-            let _ = name;
-            Err(SlotBusError::Event(
-                "named events only supported on Windows (Linux/macOS planned)".into(),
-            ))
+            let cname = std::ffi::CString::new(format!("/{name}"))
+                .map_err(|e| SlotBusError::Event(format!("invalid name: {e}")))?;
+            // Open without O_CREAT — the semaphore must already exist
+            let sem = unsafe { sem_open(cname.as_ptr(), 0, 0, 0) };
+            if sem == SEM_FAILED {
+                return Err(SlotBusError::Event(format!(
+                    "sem_open(open) failed for '{name}'"
+                )));
+            }
+            Ok(Self { sem, name: cname, created: false })
         }
     }
 
@@ -107,6 +166,10 @@ impl NamedEvent {
         #[cfg(windows)]
         unsafe {
             SetEvent(self.handle);
+        }
+        #[cfg(unix)]
+        unsafe {
+            sem_post(self.sem);
         }
     }
 
@@ -127,10 +190,33 @@ impl NamedEvent {
             let result = unsafe { WaitForSingleObject(self.handle, ms) };
             result == WAIT_OBJECT_0
         }
-        #[cfg(not(windows))]
+        // Linux: use sem_timedwait for kernel-level timed wait (sub-microsecond wake)
+        #[cfg(target_os = "linux")]
         {
-            let _ = ms;
-            false
+            let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe { clock_gettime(CLOCK_REALTIME, &mut ts); }
+            ts.tv_sec += (ms / 1000) as i64;
+            ts.tv_nsec += ((ms % 1000) as i64) * 1_000_000;
+            if ts.tv_nsec >= 1_000_000_000 {
+                ts.tv_sec += 1;
+                ts.tv_nsec -= 1_000_000_000;
+            }
+            unsafe { sem_timedwait(self.sem, &ts) == 0 }
+        }
+        // macOS: sem_timedwait is not available, poll with sem_trywait
+        #[cfg(target_os = "macos")]
+        {
+            use std::time::{Duration, Instant};
+            let deadline = Instant::now() + Duration::from_millis(ms as u64);
+            loop {
+                if unsafe { sem_trywait(self.sem) } == 0 {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
     }
 }
@@ -141,10 +227,17 @@ impl Drop for NamedEvent {
         unsafe {
             CloseHandle(self.handle);
         }
+        #[cfg(unix)]
+        {
+            unsafe { sem_close(self.sem); }
+            if self.created {
+                unsafe { sem_unlink(self.name.as_ptr()); }
+            }
+        }
     }
 }
 
-// SAFETY: Named events are thread-safe OS primitives. The handle can be
-// used from any thread (SetEvent/WaitForSingleObject are thread-safe).
+// SAFETY: Named events / POSIX semaphores are thread-safe OS primitives.
+// The handle / semaphore pointer can be used from any thread.
 unsafe impl Send for NamedEvent {}
 unsafe impl Sync for NamedEvent {}
