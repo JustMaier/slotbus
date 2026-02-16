@@ -99,8 +99,7 @@ async fn main() {
 
         let body_str = String::from_utf8_lossy(&response.body);
         println!(
-            "  [{i}] {} {} -> {} ({}) in {:.1}ms",
-            "POST",
+            "  [{i}] POST {} -> {} ({}) in {:.1}ms",
             meta.path,
             response.status,
             body_str,
