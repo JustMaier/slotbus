@@ -147,6 +147,10 @@ impl SlotBus {
         let meta_bytes = postcard::to_allocvec(meta)?;
         let method_u8 = method_to_u8(method);
 
+        // Drop any stale overflow region for this slot before writing.
+        // Prevents SHM name collisions when a slot is reused quickly.
+        self.overflow_regions.lock().unwrap().remove(&slot_index);
+
         let overflow = region::write_request(
             &self.region,
             slot_index,
@@ -377,25 +381,40 @@ impl SlotWorker {
         };
         let meta_bytes = postcard::to_allocvec(&resp_meta)?;
 
-        let overflow = region::write_response(
+        // Drop any stale overflow region for this slot before writing.
+        // Prevents SHM name collisions when a slot is reused quickly.
+        self.overflow_regions.lock().unwrap().remove(&slot_index);
+
+        let result = region::write_response(
             &self.region,
             slot_index,
             status,
             &meta_bytes,
             &body,
             &self.config,
-        )?;
+        );
 
-        if let Some(ovf) = overflow {
-            self.overflow_regions
-                .lock()
-                .unwrap()
-                .insert(slot_index, ovf);
+        match result {
+            Ok(overflow) => {
+                if let Some(ovf) = overflow {
+                    self.overflow_regions
+                        .lock()
+                        .unwrap()
+                        .insert(slot_index, ovf);
+                }
+
+                self.rsp_event.signal();
+
+                Ok(())
+            }
+            Err(e) => {
+                // Response write failed — free the slot to prevent permanent stall.
+                let slot = unsafe { self.region.slot(slot_index) };
+                slot.status
+                    .store(SLOT_FREE, Ordering::Release);
+                Err(e)
+            }
         }
-
-        self.rsp_event.signal();
-
-        Ok(())
     }
 
     /// Run the request receive loop on a blocking OS thread.
