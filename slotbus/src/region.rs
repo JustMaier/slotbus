@@ -315,7 +315,33 @@ impl std::fmt::Debug for ShmRegion {
 
 // ---- Find free slot ----------------------------------------------------------
 
+/// Atomically find and reserve a free slot via CAS `Free → Writing`.
+///
+/// Returns the slot index. The caller must call [`write_request`] to fill
+/// the slot data and transition it to `Ready`. If the write fails, the
+/// caller must set the slot back to `Free`.
+///
+/// This is safe to call from multiple threads concurrently — only one
+/// thread can win the CAS for any given slot.
+pub fn claim_free_slot(region: &ShmRegion) -> Option<usize> {
+    for i in 0..region.num_slots() {
+        let slot = unsafe { region.slot(i) };
+        if slot
+            .status
+            .compare_exchange(SLOT_FREE, SLOT_WRITING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
 /// Scan slots for the first Free one. Returns the slot index.
+///
+/// **Deprecated:** Use [`claim_free_slot`] instead. This function is not safe
+/// for concurrent callers — two threads can return the same index.
+#[deprecated(note = "Use claim_free_slot() which atomically reserves the slot")]
 pub fn find_free_slot(region: &ShmRegion) -> Option<usize> {
     for i in 0..region.num_slots() {
         let slot = unsafe { region.slot(i) };
@@ -330,9 +356,30 @@ pub fn find_free_slot(region: &ShmRegion) -> Option<usize> {
 
 /// Write request data into a slot + heap (or overflow).
 ///
-/// Sets slot status to `Ready` after writing. Returns the overflow region
-/// handle if one was needed (caller must keep it alive until the slot is freed).
+/// The slot must already be in `Writing` state (reserved via [`claim_free_slot`]).
+/// Sets slot status to `Ready` after writing. On failure, resets the slot to `Free`.
+/// Returns the overflow region handle if one was needed (caller must keep it alive).
 pub fn write_request(
+    region: &ShmRegion,
+    slot_index: usize,
+    req_id: &str,
+    method: u8,
+    meta_bytes: &[u8],
+    body: &[u8],
+    config: &SlotBusConfig,
+) -> Result<Option<ShmRegion>, SlotBusError> {
+    match write_request_inner(region, slot_index, req_id, method, meta_bytes, body, config) {
+        Ok(overflow) => Ok(overflow),
+        Err(e) => {
+            // Release the reserved slot so it doesn't stay stuck in Writing.
+            let slot = unsafe { region.slot(slot_index) };
+            slot.status.store(SLOT_FREE, Ordering::Release);
+            Err(e)
+        }
+    }
+}
+
+fn write_request_inner(
     region: &ShmRegion,
     slot_index: usize,
     req_id: &str,
@@ -408,7 +455,7 @@ pub fn write_request(
         overflow_region = Some(ovf);
     }
 
-    // Set status -> Ready
+    // Set status -> Ready (Writing → Ready)
     slot.status.store(SLOT_READY, Ordering::Release);
 
     Ok(overflow_region)

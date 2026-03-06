@@ -33,6 +33,13 @@ pub const SLOT_CLAIMED: u32 = 2;
 /// Slot status: worker has written the response, waiting for hub to read.
 pub const SLOT_DONE: u32 = 3;
 
+/// Slot status: hub is writing request data into this slot.
+///
+/// Used by [`claim_free_slot`](crate::region::claim_free_slot) to atomically
+/// reserve a slot before writing. Prevents two concurrent dispatchers from
+/// grabbing the same slot. Transitions to `SLOT_READY` after the write completes.
+pub const SLOT_WRITING: u32 = 4;
+
 /// HTTP method encoding (single byte in slot metadata).
 pub const METHOD_GET: u8 = 0;
 pub const METHOD_POST: u8 = 1;

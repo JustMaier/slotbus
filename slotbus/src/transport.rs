@@ -141,7 +141,7 @@ impl SlotBus {
         // Try to reclaim heap space
         self.region.try_reset_heap();
 
-        let slot_index = region::find_free_slot(&self.region)
+        let slot_index = region::claim_free_slot(&self.region)
             .ok_or(SlotBusError::NoFreeSlots(self.config.num_slots))?;
 
         let meta_bytes = postcard::to_allocvec(meta)?;
