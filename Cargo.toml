@@ -3,10 +3,10 @@ members = ["slotbus"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.75"
-authors = ["Justin Zipperle"]
+authors = ["Justin Maier"]
 license = "MIT"
 repository = "https://github.com/JustMaier/slotbus"
 homepage = "https://github.com/JustMaier/slotbus"
