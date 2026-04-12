@@ -274,6 +274,23 @@ impl SlotBus {
             .expect("failed to spawn slotbus response watcher thread")
     }
 
+    /// Read the atomic state of every slot, returning `(index, raw_state)` pairs.
+    ///
+    /// Useful for diagnostics dashboards. State values:
+    /// - `0` = Free
+    /// - `1` = Ready (hub wrote request, waiting for worker)
+    /// - `2` = Claimed (worker processing)
+    /// - `3` = Done (worker wrote response, waiting for hub)
+    /// - `4` = Writing (hub reserving slot)
+    pub fn slot_diagnostics(&self) -> Vec<(usize, u32)> {
+        (0..self.region.num_slots())
+            .map(|i| {
+                let slot = unsafe { self.region.slot(i) };
+                (i, slot.status.load(std::sync::atomic::Ordering::Relaxed))
+            })
+            .collect()
+    }
+
     /// Signal the response watcher and receive loops to stop.
     ///
     /// Called automatically when the `SlotBus` is dropped. You can also
