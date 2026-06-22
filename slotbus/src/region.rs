@@ -159,6 +159,25 @@ impl ShmRegion {
         std::slice::from_raw_parts(p, len)
     }
 
+    /// Bounds-checked heap read. Validates `offset + len` against the heap
+    /// size before dereferencing, so a stale or garbage `offset`/`len` — e.g.
+    /// a slot whose heap bytes were reset/overwritten by a concurrent
+    /// `reset_heap` while this reader was mid-flight — yields a recoverable
+    /// error instead of a wild `from_raw_parts` that walks off the mapping
+    /// and access-violates (0xC0000005). This is the safe entry point for all
+    /// read paths; prefer it over the unchecked `heap_read`.
+    pub fn heap_read_checked(&self, offset: u32, len: usize) -> Result<&[u8], SlotBusError> {
+        match (offset as usize).checked_add(len) {
+            Some(end) if end <= self.heap_size => {
+                Ok(unsafe { self.heap_read(offset, len) })
+            }
+            _ => Err(SlotBusError::InvalidRegion(format!(
+                "heap read out of bounds: offset={offset} len={len} heap_size={}",
+                self.heap_size
+            ))),
+        }
+    }
+
     /// Write `data` to the heap at `offset`.
     ///
     /// # Safety
@@ -166,6 +185,26 @@ impl ShmRegion {
     pub unsafe fn heap_write(&self, offset: u32, data: &[u8]) {
         let p = self.heap_ptr().add(offset as usize);
         std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len());
+    }
+
+    /// Bounds-checked heap write. Validates `offset + data.len()` against the
+    /// heap size before writing, so a corrupt/stale offset can't `copy` past
+    /// the mapping and access-violate (0xC0000005 WRITE). Mirrors
+    /// `heap_read_checked`; the safe entry point for all write paths. Logs the
+    /// offending geometry on violation so the bad value is captured.
+    pub fn heap_write_checked(&self, offset: u32, data: &[u8]) -> Result<(), SlotBusError> {
+        match (offset as usize).checked_add(data.len()) {
+            Some(end) if end <= self.heap_size => {
+                unsafe { self.heap_write(offset, data) };
+                Ok(())
+            }
+            _ => Err(SlotBusError::InvalidRegion(format!(
+                "heap write out of bounds: offset={offset} len={} heap_size={} base={:p}",
+                data.len(),
+                self.heap_size,
+                self.ptr
+            ))),
+        }
     }
 
     /// Allocate `size` bytes from the inline heap (bump allocator).
@@ -388,6 +427,12 @@ fn write_request_inner(
     body: &[u8],
     config: &SlotBusConfig,
 ) -> Result<Option<ShmRegion>, SlotBusError> {
+    if slot_index >= region.num_slots() {
+        return Err(SlotBusError::InvalidRegion(format!(
+            "write_request slot_index {slot_index} >= num_slots {}",
+            region.num_slots()
+        )));
+    }
     let slot = unsafe { region.slot(slot_index) };
 
     // Write req_id + method via raw pointer
@@ -407,9 +452,7 @@ fn write_request_inner(
     let meta_offset = region
         .alloc_heap(meta_bytes.len())
         .ok_or_else(|| SlotBusError::SharedMemory("heap full for request meta".into()))?;
-    unsafe {
-        region.heap_write(meta_offset, meta_bytes);
-    }
+    region.heap_write_checked(meta_offset, meta_bytes)?;
 
     // Write meta pointer fields
     unsafe {
@@ -432,8 +475,8 @@ fn write_request_inner(
             slot_ptr.add(60).write(0);
         }
     } else if let Some(body_offset) = region.alloc_heap(body.len()) {
+        region.heap_write_checked(body_offset, body)?;
         unsafe {
-            region.heap_write(body_offset, body);
             let slot_ptr = region
                 .as_ptr()
                 .add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
@@ -472,6 +515,12 @@ pub fn write_response(
     body: &[u8],
     config: &SlotBusConfig,
 ) -> Result<Option<ShmRegion>, SlotBusError> {
+    if slot_index >= region.num_slots() {
+        return Err(SlotBusError::InvalidRegion(format!(
+            "write_response slot_index {slot_index} >= num_slots {}",
+            region.num_slots()
+        )));
+    }
     let slot = unsafe { region.slot(slot_index) };
 
     // Write resp_status
@@ -486,9 +535,7 @@ pub fn write_response(
     let meta_offset = region
         .alloc_heap(meta_bytes.len())
         .ok_or_else(|| SlotBusError::SharedMemory("heap full for response meta".into()))?;
-    unsafe {
-        region.heap_write(meta_offset, meta_bytes);
-    }
+    region.heap_write_checked(meta_offset, meta_bytes)?;
 
     unsafe {
         let slot_ptr = region
@@ -510,8 +557,8 @@ pub fn write_response(
             slot_ptr.add(84).write(0);
         }
     } else if let Some(body_offset) = region.alloc_heap(body.len()) {
+        region.heap_write_checked(body_offset, body)?;
         unsafe {
-            region.heap_write(body_offset, body);
             let slot_ptr = region
                 .as_ptr()
                 .add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
@@ -557,8 +604,8 @@ pub fn read_request(
 
     let method = slot.method;
 
-    let meta: RequestMeta = unsafe {
-        let meta_bytes = region.heap_read(slot.meta_offset, slot.meta_len as usize);
+    let meta: RequestMeta = {
+        let meta_bytes = region.heap_read_checked(slot.meta_offset, slot.meta_len as usize)?;
         postcard::from_bytes(meta_bytes)?
     };
 
@@ -566,8 +613,7 @@ pub fn read_request(
     let body = if body_len == 0 {
         Vec::new()
     } else if slot.body_overflow == 0 {
-        let bytes = unsafe { region.heap_read(slot.body_offset, body_len) };
-        bytes.to_vec()
+        region.heap_read_checked(slot.body_offset, body_len)?.to_vec()
     } else {
         let name = config.request_overflow_name(slot_index);
         ShmRegion::read_overflow(&name, body_len)?
@@ -585,8 +631,9 @@ pub fn read_response(
     let slot = unsafe { region.slot(slot_index) };
     let status = slot.resp_status;
 
-    let meta: ResponseMeta = unsafe {
-        let meta_bytes = region.heap_read(slot.resp_meta_offset, slot.resp_meta_len as usize);
+    let meta: ResponseMeta = {
+        let meta_bytes =
+            region.heap_read_checked(slot.resp_meta_offset, slot.resp_meta_len as usize)?;
         postcard::from_bytes(meta_bytes)?
     };
 
@@ -594,8 +641,9 @@ pub fn read_response(
     let body = if body_len == 0 {
         Vec::new()
     } else if slot.resp_body_overflow == 0 {
-        let bytes = unsafe { region.heap_read(slot.resp_body_offset, body_len) };
-        bytes.to_vec()
+        region
+            .heap_read_checked(slot.resp_body_offset, body_len)?
+            .to_vec()
     } else {
         let name = config.response_overflow_name(slot_index);
         ShmRegion::read_overflow(&name, body_len)?
