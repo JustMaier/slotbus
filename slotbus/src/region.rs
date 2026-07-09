@@ -322,6 +322,18 @@ impl ShmRegion {
         let size = (data.len() + 4095) & !4095;
         let size = size.max(4096);
         let region = Self::create_or_open(name, size)?;
+        // create_or_open falls back to opening an EXISTING mapping when the
+        // name is already in use (e.g. a prior overflow for this slot whose
+        // handle is still held somewhere). That mapping keeps its original
+        // size, so a larger payload here would copy past the end of the
+        // mapping — a wild write (0xC0000005). Mirror read_overflow's check.
+        if region.len < data.len() {
+            return Err(SlotBusError::SharedMemory(format!(
+                "overflow region '{name}' too small for write: need {}, have {} (stale same-name mapping still open)",
+                data.len(),
+                region.len
+            )));
+        }
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), region.ptr, data.len());
         }
