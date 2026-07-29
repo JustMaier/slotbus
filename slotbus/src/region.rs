@@ -314,20 +314,102 @@ impl ShmRegion {
 
     // ---- Overflow helpers (static) -------------------------------------------
 
+    /// Round a payload length up to the mapping granularity (4KiB pages).
+    fn overflow_size_for(len: usize) -> usize {
+        ((len + 4095) & !4095).max(4096)
+    }
+
+    /// Create a named region, returning `Ok(None)` if the name is already taken.
+    ///
+    /// Unlike [`create_or_open`](Self::create_or_open) this never adopts a
+    /// mapping created by someone else, so the caller can be certain the
+    /// returned region has the size it asked for.
+    fn create_exclusive(name: &str, size: usize) -> Result<Option<Self>, SlotBusError> {
+        match ShmemConf::new().os_id(name).size(size).create() {
+            Ok(shmem) => {
+                let ptr = shmem.as_ptr();
+                let len = shmem.len();
+                Ok(Some(Self {
+                    _shmem: shmem,
+                    ptr,
+                    len,
+                    name: name.to_string(),
+                    num_slots: 0,
+                    heap_offset: 0,
+                    heap_size: 0,
+                }))
+            }
+            Err(ShmemError::MappingIdExists) => Ok(None),
+            Err(e) => Err(SlotBusError::SharedMemory(format!("create '{name}': {e}"))),
+        }
+    }
+
     /// Create an overflow region and write data into it.
+    ///
+    /// Fails rather than adopting an existing same-name mapping: such a
+    /// mapping keeps its original size, so writing a larger payload into it
+    /// would copy past the end — a wild write (0xC0000005). Callers that can
+    /// tolerate a different name should prefer
+    /// [`create_overflow_fresh`](Self::create_overflow_fresh), which retries
+    /// under a new generation instead of failing.
     pub fn create_overflow(name: &str, data: &[u8]) -> Result<Self, SlotBusError> {
-        // Round up to page size (4096 on Windows)
-        let size = (data.len() + 4095) & !4095;
-        let size = size.max(4096);
-        let region = Self::create_or_open(name, size)?;
-        // create_or_open falls back to opening an EXISTING mapping when the
-        // name is already in use (e.g. a prior overflow for this slot whose
-        // handle is still held somewhere). That mapping keeps its original
-        // size, so a larger payload here would copy past the end of the
-        // mapping — a wild write (0xC0000005). Mirror read_overflow's check.
+        let size = Self::overflow_size_for(data.len());
+        let Some(region) = Self::create_exclusive(name, size)? else {
+            return Err(SlotBusError::SharedMemory(format!(
+                "overflow region '{name}' already exists: need {} bytes (stale same-name mapping still open)",
+                data.len()
+            )));
+        };
+        Self::fill_overflow(region, name, data)
+    }
+
+    /// Create a *fresh* overflow region, advancing the generation until a name
+    /// is found that no one else holds open.
+    ///
+    /// `name_for(generation)` supplies the candidate name for each attempt;
+    /// generation 0 is the historical un-suffixed name, so the uncontended
+    /// path is unchanged. Returns the region plus the **overflow marker** to
+    /// store in the slot: `generation + 1`, matching the encoding documented
+    /// on [`OVERFLOW_INLINE`].
+    ///
+    /// This is what makes a leaked handle survivable. A stale mapping — held
+    /// by, say, a `SlotWorker` from a previous connection that never dropped —
+    /// used to poison its slot permanently, because every later payload larger
+    /// than the stale mapping tried to reuse that exact name and was refused.
+    /// Advancing the generation sidesteps the corpse instead of dying on it.
+    pub fn create_overflow_fresh<F>(name_for: F, data: &[u8]) -> Result<(Self, u8), SlotBusError>
+    where
+        F: Fn(u8) -> String,
+    {
+        let size = Self::overflow_size_for(data.len());
+        let mut last_name = String::new();
+
+        for generation in 0..=MAX_OVERFLOW_GENERATION {
+            let name = name_for(generation);
+            if let Some(region) = Self::create_exclusive(&name, size)? {
+                let region = Self::fill_overflow(region, &name, data)?;
+                return Ok((region, generation + 1));
+            }
+            last_name = name;
+        }
+
+        Err(SlotBusError::SharedMemory(format!(
+            "exhausted all {} overflow generations for '{last_name}': need {} bytes \
+             (stale same-name mappings still open)",
+            MAX_OVERFLOW_GENERATION as u16 + 1,
+            data.len()
+        )))
+    }
+
+    /// Copy `data` into a freshly created overflow region, bounds-checked.
+    ///
+    /// The region was created at a size rounded up from `data.len()`, so this
+    /// should never fail; the check is here so a surprising allocator result
+    /// surfaces as an error rather than a wild write.
+    fn fill_overflow(region: Self, name: &str, data: &[u8]) -> Result<Self, SlotBusError> {
         if region.len < data.len() {
             return Err(SlotBusError::SharedMemory(format!(
-                "overflow region '{name}' too small for write: need {}, have {} (stale same-name mapping still open)",
+                "overflow region '{name}' too small for write: need {}, have {}",
                 data.len(),
                 region.len
             )));
@@ -495,15 +577,17 @@ fn write_request_inner(
             slot_ptr.add(60).write(0);
         }
     } else {
-        let name = config.request_overflow_name(slot_index);
-        let ovf = ShmRegion::create_overflow(&name, body)?;
+        let (ovf, marker) = ShmRegion::create_overflow_fresh(
+            |generation| config.request_overflow_name_gen(slot_index, generation),
+            body,
+        )?;
         unsafe {
             let slot_ptr = region
                 .as_ptr()
                 .add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
             (slot_ptr.add(52) as *mut u32).write(0);
             (slot_ptr.add(56) as *mut u32).write(body.len() as u32);
-            slot_ptr.add(60).write(1);
+            slot_ptr.add(60).write(marker);
         }
         overflow_region = Some(ovf);
     }
@@ -577,15 +661,17 @@ pub fn write_response(
             slot_ptr.add(84).write(0);
         }
     } else {
-        let name = config.response_overflow_name(slot_index);
-        let ovf = ShmRegion::create_overflow(&name, body)?;
+        let (ovf, marker) = ShmRegion::create_overflow_fresh(
+            |generation| config.response_overflow_name_gen(slot_index, generation),
+            body,
+        )?;
         unsafe {
             let slot_ptr = region
                 .as_ptr()
                 .add(SHM_HEADER_SIZE + slot_index * SLOT_META_SIZE);
             (slot_ptr.add(76) as *mut u32).write(0);
             (slot_ptr.add(80) as *mut u32).write(body.len() as u32);
-            slot_ptr.add(84).write(1);
+            slot_ptr.add(84).write(marker);
         }
         overflow_region = Some(ovf);
     }
@@ -620,15 +706,15 @@ pub fn read_request(
     };
 
     let body_len = slot.body_len as usize;
-    let body = if body_len == 0 {
-        Vec::new()
-    } else if slot.body_overflow == 0 {
-        region
+    let body = match overflow_generation(slot.body_overflow) {
+        _ if body_len == 0 => Vec::new(),
+        None => region
             .heap_read_checked(slot.body_offset, body_len)?
-            .to_vec()
-    } else {
-        let name = config.request_overflow_name(slot_index);
-        ShmRegion::read_overflow(&name, body_len)?
+            .to_vec(),
+        Some(generation) => {
+            let name = config.request_overflow_name_gen(slot_index, generation);
+            ShmRegion::read_overflow(&name, body_len)?
+        }
     };
 
     Ok((req_id, method, meta, body))
@@ -650,15 +736,15 @@ pub fn read_response(
     };
 
     let body_len = slot.resp_body_len as usize;
-    let body = if body_len == 0 {
-        Vec::new()
-    } else if slot.resp_body_overflow == 0 {
-        region
+    let body = match overflow_generation(slot.resp_body_overflow) {
+        _ if body_len == 0 => Vec::new(),
+        None => region
             .heap_read_checked(slot.resp_body_offset, body_len)?
-            .to_vec()
-    } else {
-        let name = config.response_overflow_name(slot_index);
-        ShmRegion::read_overflow(&name, body_len)?
+            .to_vec(),
+        Some(generation) => {
+            let name = config.response_overflow_name_gen(slot_index, generation);
+            ShmRegion::read_overflow(&name, body_len)?
+        }
     };
 
     Ok((status, meta, body))

@@ -40,6 +40,18 @@ fn sanitize_os_name(name: &str) -> String {
     name.to_string()
 }
 
+/// Build the raw (pre-sanitization) overflow region name.
+///
+/// Generation 0 deliberately omits the suffix so it matches the name older
+/// slotbus versions derive, keeping the uncontended path wire-compatible.
+fn overflow_name(prefix: &str, name: &str, kind: &str, slot: usize, generation: u8) -> String {
+    if generation == 0 {
+        format!("{prefix}-{name}-{kind}-{slot}")
+    } else {
+        format!("{prefix}-{name}-{kind}-{slot}-g{generation}")
+    }
+}
+
 /// Configuration for a slotbus shared memory region.
 ///
 /// Use the builder pattern to customize behavior:
@@ -115,13 +127,49 @@ impl SlotBusConfig {
     }
 
     /// The OS-level name for a request overflow region at a given slot.
+    ///
+    /// Equivalent to [`request_overflow_name_gen`](Self::request_overflow_name_gen)
+    /// at generation 0.
     pub fn request_overflow_name(&self, slot: usize) -> String {
-        sanitize_os_name(&format!("{}-{}-req-{}", self.prefix, self.name, slot))
+        self.request_overflow_name_gen(slot, 0)
     }
 
     /// The OS-level name for a response overflow region at a given slot.
+    ///
+    /// Equivalent to [`response_overflow_name_gen`](Self::response_overflow_name_gen)
+    /// at generation 0.
     pub fn response_overflow_name(&self, slot: usize) -> String {
-        sanitize_os_name(&format!("{}-{}-rsp-{}", self.prefix, self.name, slot))
+        self.response_overflow_name_gen(slot, 0)
+    }
+
+    /// The OS-level name for a request overflow region at a given slot and
+    /// generation.
+    ///
+    /// Generation 0 produces the historical, un-suffixed name so that the
+    /// common case stays byte-identical to older peers. Higher generations
+    /// append `-g{n}` and are only reached when a same-name mapping is still
+    /// held open by someone else — see
+    /// [`ShmRegion::create_overflow_fresh`](crate::region::ShmRegion::create_overflow_fresh).
+    pub fn request_overflow_name_gen(&self, slot: usize, generation: u8) -> String {
+        sanitize_os_name(&overflow_name(
+            &self.prefix,
+            &self.name,
+            "req",
+            slot,
+            generation,
+        ))
+    }
+
+    /// The OS-level name for a response overflow region at a given slot and
+    /// generation. See [`request_overflow_name_gen`](Self::request_overflow_name_gen).
+    pub fn response_overflow_name_gen(&self, slot: usize, generation: u8) -> String {
+        sanitize_os_name(&overflow_name(
+            &self.prefix,
+            &self.name,
+            "rsp",
+            slot,
+            generation,
+        ))
     }
 }
 

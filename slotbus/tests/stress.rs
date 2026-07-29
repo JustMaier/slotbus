@@ -676,3 +676,203 @@ fn race_heap_exhaustion_stale_offset() {
         "Heap exhaustion stale offset race confirmed: {c} corruptions"
     );
 }
+
+// ---- Overflow region generation (stale same-name mapping) --------------------
+//
+// Production symptom these cover, from a hub worker under reconnect churn:
+//
+//     [AGENT] Failed to write response to slot 1: shared memory error:
+//     overflow region 'hub-agent-rsp-1' too small for write:
+//     need 76533, have 4096 (stale same-name mapping still open)
+//
+// A previous, smaller overflow mapping for that slot was still held open by
+// someone — e.g. a SlotWorker from a prior connection that was never dropped.
+// On Windows, creating a mapping under a name that already exists hands back
+// the EXISTING mapping at its original size, so the larger write was refused
+// and that slot stayed poisoned for every subsequent large payload.
+
+/// The exact production scenario: a small overflow mapping for a slot is still
+/// held open when a much larger payload needs the same slot.
+///
+/// Before generation-stamping this returned "too small for write" forever.
+/// Now the writer steps to the next generation and succeeds, and a reader
+/// following the marker gets the new payload, not the stale one.
+#[test]
+fn overflow_survives_stale_same_name_mapping() {
+    let config = make_config("ovf-stale", 4, 64 * 1024);
+    let slot = 1;
+
+    // A prior, small overflow region for this slot, deliberately kept alive.
+    let small = vec![0xAA_u8; 1024];
+    let (stale, stale_marker) =
+        ShmRegion::create_overflow_fresh(|g| config.response_overflow_name_gen(slot, g), &small)
+            .expect("first overflow should be creatable");
+    assert_eq!(stale_marker, 1, "first writer must take generation 0");
+    assert_eq!(
+        stale.name(),
+        config.response_overflow_name(slot),
+        "generation 0 must use the historical un-suffixed name"
+    );
+
+    // The payload that used to fail: far larger than the stale mapping.
+    let big = vec![0xBB_u8; 76_533];
+    let (fresh, marker) =
+        ShmRegion::create_overflow_fresh(|g| config.response_overflow_name_gen(slot, g), &big)
+            .expect("larger payload must not be blocked by the stale mapping");
+
+    assert_eq!(marker, 2, "must advance to generation 1");
+    assert!(fresh.len() >= big.len());
+
+    // A reader following the marker sees the new payload.
+    let generation = overflow_generation(marker).expect("marker must decode");
+    let name = config.response_overflow_name_gen(slot, generation);
+    let read = ShmRegion::read_overflow(&name, big.len()).expect("read fresh region");
+    assert_eq!(read, big, "reader must get the new payload");
+
+    // And the stale region is untouched, still holding its original bytes.
+    let stale_name = config.response_overflow_name_gen(slot, 0);
+    let stale_read = ShmRegion::read_overflow(&stale_name, small.len()).expect("read stale");
+    assert_eq!(stale_read, small, "stale region must not be overwritten");
+
+    drop(stale);
+    drop(fresh);
+}
+
+/// `create_overflow` must never adopt a mapping it did not create. Adopting one
+/// is what produced the wild write (0xC0000005) before the 0.1.3 guard.
+#[test]
+fn create_overflow_refuses_to_adopt_existing_mapping() {
+    let config = make_config("ovf-adopt", 4, 64 * 1024);
+    let name = config.response_overflow_name(0);
+
+    let held = ShmRegion::create_overflow(&name, &vec![0x11_u8; 512]).expect("first create");
+
+    let err = ShmRegion::create_overflow(&name, &vec![0x22_u8; 40_000])
+        .expect_err("must refuse rather than write into a mapping it did not create");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("already exists"),
+        "unexpected error text: {msg}"
+    );
+    drop(held);
+}
+
+/// Generation 0 must serialize to the byte-identical name older peers derive,
+/// and only higher generations may carry a suffix. This is the wire-compat
+/// guarantee that lets the uncontended path talk to an older slotbus.
+#[test]
+fn generation_zero_name_is_unchanged() {
+    let config = make_config("ovf-names", 4, 64 * 1024);
+
+    assert_eq!(
+        config.response_overflow_name_gen(3, 0),
+        config.response_overflow_name(3)
+    );
+    assert_eq!(
+        config.request_overflow_name_gen(3, 0),
+        config.request_overflow_name(3)
+    );
+    assert_ne!(
+        config.response_overflow_name_gen(3, 1),
+        config.response_overflow_name_gen(3, 0)
+    );
+
+    // Distinct generations must never collide.
+    let mut seen = std::collections::HashSet::new();
+    for g in 0..=8u8 {
+        assert!(
+            seen.insert(config.response_overflow_name_gen(3, g)),
+            "generation {g} collided with an earlier name"
+        );
+    }
+}
+
+/// Marker encoding: 0 is inline, everything else decodes to `marker - 1`.
+#[test]
+fn overflow_marker_encoding_round_trips() {
+    assert_eq!(overflow_generation(OVERFLOW_INLINE), None);
+    assert_eq!(overflow_generation(1), Some(0));
+    assert_eq!(overflow_generation(2), Some(1));
+    assert_eq!(overflow_generation(255), Some(MAX_OVERFLOW_GENERATION));
+}
+
+/// End-to-end through the real write/read response path, with a stale mapping
+/// pinned open for the slot. This exercises the production code path, not just
+/// the region helper.
+#[test]
+fn write_response_round_trips_past_a_stale_overflow() {
+    // Small heap so a large body is forced down the overflow path.
+    let config = make_config("ovf-e2e", 2, SHM_HEADER_SIZE + 2 * SLOT_META_SIZE + 4096);
+    let region = create_region(&config);
+    let slot = 0;
+
+    // Pin a small mapping under the generation-0 name for this slot.
+    let stale = ShmRegion::create_overflow(&config.response_overflow_name_gen(slot, 0), &[7u8; 64])
+        .expect("pin stale mapping");
+
+    let body: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+    let meta_bytes = postcard::to_allocvec(&ResponseMeta {
+        content_type: "application/octet-stream".into(),
+        headers: vec![],
+    })
+    .unwrap();
+
+    let ovf = region::write_response(&region, slot, 200, &meta_bytes, &body, &config)
+        .expect("write_response must route around the stale mapping");
+
+    let slot_meta = unsafe { region.slot(slot) };
+    assert_eq!(
+        slot_meta.resp_body_overflow, 2,
+        "slot must record generation 1"
+    );
+
+    let (status, _meta, read_body) =
+        region::read_response(&region, slot, &config).expect("read_response");
+    assert_eq!(status, 200);
+    assert_eq!(read_body, body, "body must survive the generation bump");
+
+    drop(ovf);
+    drop(stale);
+}
+
+/// A reader holding a stale marker must never be silently handed a different
+/// payload written for a reused slot. The generation in the marker pins the
+/// reader to the exact region its response was written into.
+#[test]
+fn slow_reader_is_not_handed_a_reused_slots_region() {
+    let config = make_config("ovf-reuse", 4, 64 * 1024);
+    let slot = 2;
+
+    let first = vec![0xC1_u8; 5_000];
+    let (region_a, marker_a) =
+        ShmRegion::create_overflow_fresh(|g| config.response_overflow_name_gen(slot, g), &first)
+            .expect("first payload");
+
+    // The slot gets reused for a second, larger payload while a slow reader
+    // still holds marker_a and has not yet opened its region.
+    let second = vec![0xC2_u8; 50_000];
+    let (region_b, marker_b) =
+        ShmRegion::create_overflow_fresh(|g| config.response_overflow_name_gen(slot, g), &second)
+            .expect("second payload");
+
+    assert_ne!(marker_a, marker_b, "reuse must land on a new generation");
+
+    // The slow reader now resolves its marker, and gets its own payload.
+    let gen_a = overflow_generation(marker_a).unwrap();
+    let read_a =
+        ShmRegion::read_overflow(&config.response_overflow_name_gen(slot, gen_a), first.len())
+            .expect("slow reader resolves its own region");
+    assert_eq!(read_a, first, "slow reader must not see the reused payload");
+
+    let gen_b = overflow_generation(marker_b).unwrap();
+    let read_b = ShmRegion::read_overflow(
+        &config.response_overflow_name_gen(slot, gen_b),
+        second.len(),
+    )
+    .expect("new reader resolves the new region");
+    assert_eq!(read_b, second);
+
+    drop(region_a);
+    drop(region_b);
+}

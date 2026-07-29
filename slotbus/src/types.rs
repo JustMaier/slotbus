@@ -40,6 +40,39 @@ pub const SLOT_DONE: u32 = 3;
 /// grabbing the same slot. Transitions to `SLOT_READY` after the write completes.
 pub const SLOT_WRITING: u32 = 4;
 
+// ---- Overflow marker encoding ------------------------------------------------
+//
+// The `body_overflow` / `resp_body_overflow` slot bytes encode *where* a body
+// lives. Historically they were a plain bool (0 = inline, 1 = overflow). The
+// encoding is now a generation counter, chosen so the common case is
+// byte-identical to what older peers write and read:
+//
+//   0        body is inline in the shared heap
+//   1        body is in the overflow region at generation 0 (un-suffixed name)
+//   2..=255  body is in the overflow region at generation `marker - 1`,
+//            whose name carries a `-g{generation}` suffix
+//
+// Generations above 0 are only reached when a same-name mapping is still held
+// open by someone else. A peer running an older slotbus reads any non-zero
+// marker as "generation 0" and will fail to find a suffixed region — but that
+// only happens in the exact situation where the older code could not have
+// written the payload at all, so nothing that used to work regresses.
+
+/// `body_overflow` marker: the body is stored inline in the shared heap.
+pub const OVERFLOW_INLINE: u8 = 0;
+
+/// Highest overflow generation that can be encoded in a marker byte.
+///
+/// Markers run `1..=255`, so generations run `0..=254`.
+pub const MAX_OVERFLOW_GENERATION: u8 = 254;
+
+/// Convert an overflow marker byte into its generation.
+///
+/// Returns `None` for [`OVERFLOW_INLINE`], which has no generation.
+pub fn overflow_generation(marker: u8) -> Option<u8> {
+    marker.checked_sub(1)
+}
+
 /// HTTP method encoding (single byte in slot metadata).
 pub const METHOD_GET: u8 = 0;
 pub const METHOD_POST: u8 = 1;
@@ -132,7 +165,8 @@ pub struct SlotMeta {
     pub body_offset: u32,
     /// Length of request body.
     pub body_len: u32,
-    /// 0 = body is inline in heap, 1 = body is in an overflow region.
+    /// Overflow marker: 0 = inline in heap, `n` = overflow generation `n - 1`.
+    /// See [`OVERFLOW_INLINE`] for the full encoding.
     pub body_overflow: u8,
     _pad2: [u8; 3],
 
@@ -149,7 +183,8 @@ pub struct SlotMeta {
     pub resp_body_offset: u32,
     /// Length of response body.
     pub resp_body_len: u32,
-    /// 0 = body is inline in heap, 1 = body is in an overflow region.
+    /// Overflow marker: 0 = inline in heap, `n` = overflow generation `n - 1`.
+    /// See [`OVERFLOW_INLINE`] for the full encoding.
     pub resp_body_overflow: u8,
     _pad5: [u8; 3],
 
