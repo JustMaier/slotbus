@@ -73,4 +73,14 @@ Minimum to call it "fixed": **C** (parity with the heap guard now shipped) + **A
 | worker receive loop (READY→CLAIMED, read_request, err→FREE) | `slotbus/src/transport.rs:459-505` |
 
 ## 5. Downstream rebuild note
-slotbus is a path dep of every hub worker (hub, agent-server, tts-server, stt-server) in ai-notifications. After any slotbus change, rebuild them. As of this handoff, hub + agent-server are rebuilt with the shipped guard; **tts-server + stt-server still run the old slotbus** (wire-compatible, so fine, but they lack the guard — rebuild to get it everywhere).
+slotbus reaches the downstream app (ai-notifications) as a path dep of every hub worker. After any slotbus change, rebuild them all — an un-rebuilt worker stays wire-compatible but takes the wild write instead of the clean error.
+
+**Updated 2026-07-29:** every worker now carries the guard — hub, agent-server, tts-server, stt-server, and discord-bridge. The earlier note here claimed tts-server and stt-server were still stale; that was wrong by the time anyone read it.
+
+To audit a binary rather than trusting a doc, grep it for the guard's error string, which exists in no commit before `c22d74d`:
+
+```
+grep -c "too small for write" <binary>
+```
+
+`1` means the binary was built after the fix, `0` means it wasn't. Pair it with a control that should be present (`shared memory error`) and one that shouldn't, so a silently-failing grep can't read as a pass.
