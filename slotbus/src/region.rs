@@ -168,9 +168,7 @@ impl ShmRegion {
     /// read paths; prefer it over the unchecked `heap_read`.
     pub fn heap_read_checked(&self, offset: u32, len: usize) -> Result<&[u8], SlotBusError> {
         match (offset as usize).checked_add(len) {
-            Some(end) if end <= self.heap_size => {
-                Ok(unsafe { self.heap_read(offset, len) })
-            }
+            Some(end) if end <= self.heap_size => Ok(unsafe { self.heap_read(offset, len) }),
             _ => Err(SlotBusError::InvalidRegion(format!(
                 "heap read out of bounds: offset={offset} len={len} heap_size={}",
                 self.heap_size
@@ -625,7 +623,9 @@ pub fn read_request(
     let body = if body_len == 0 {
         Vec::new()
     } else if slot.body_overflow == 0 {
-        region.heap_read_checked(slot.body_offset, body_len)?.to_vec()
+        region
+            .heap_read_checked(slot.body_offset, body_len)?
+            .to_vec()
     } else {
         let name = config.request_overflow_name(slot_index);
         ShmRegion::read_overflow(&name, body_len)?

@@ -82,7 +82,13 @@ fn race_find_free_slot_not_atomic() {
                     let meta_bytes = postcard::to_allocvec(&meta).unwrap();
 
                     let Ok(_) = region::write_request(
-                        &region, slot_index, &req_id, METHOD_GET, &meta_bytes, &[], &config,
+                        &region,
+                        slot_index,
+                        &req_id,
+                        METHOD_GET,
+                        &meta_bytes,
+                        &[],
+                        &config,
                     ) else {
                         continue; // heap full (slot already freed by write_request error handler)
                     };
@@ -116,7 +122,8 @@ fn race_find_free_slot_not_atomic() {
         .collect();
 
     for h in handles {
-        h.join().expect("thread panicked (possible access violation!)");
+        h.join()
+            .expect("thread panicked (possible access violation!)");
     }
 
     let c = corruptions.load(Ordering::Relaxed);
@@ -175,7 +182,13 @@ fn race_heap_reset_during_write() {
                 let body = vec![0xAA_u8; 256];
 
                 if region::write_request(
-                    &region, slot_index, &req_id, METHOD_GET, &meta_bytes, &body, &config,
+                    &region,
+                    slot_index,
+                    &req_id,
+                    METHOD_GET,
+                    &meta_bytes,
+                    &body,
+                    &config,
                 )
                 .is_err()
                 {
@@ -252,7 +265,13 @@ fn race_heap_reset_during_write() {
                 let body = vec![0xBB_u8; 256];
 
                 if region::write_request(
-                    &region, slot_index, &req_id, METHOD_POST, &meta_bytes, &body, &config,
+                    &region,
+                    slot_index,
+                    &req_id,
+                    METHOD_POST,
+                    &meta_bytes,
+                    &body,
+                    &config,
                 )
                 .is_err()
                 {
@@ -339,7 +358,13 @@ fn full_pipeline_burst() {
                 region.try_reset_heap();
 
                 if region::write_request(
-                    &region, slot_index, &req_id, METHOD_GET, &meta_bytes, &[], &config,
+                    &region,
+                    slot_index,
+                    &req_id,
+                    METHOD_GET,
+                    &meta_bytes,
+                    &[],
+                    &config,
                 )
                 .is_err()
                 {
@@ -386,7 +411,13 @@ fn full_pipeline_burst() {
                 region.try_reset_heap();
 
                 if region::write_request(
-                    &region, slot_index, &req_id, METHOD_GET, &meta_bytes, &[], &config,
+                    &region,
+                    slot_index,
+                    &req_id,
+                    METHOD_GET,
+                    &meta_bytes,
+                    &[],
+                    &config,
                 )
                 .is_err()
                 {
@@ -406,7 +437,6 @@ fn full_pipeline_burst() {
         let corruptions = Arc::clone(&corruptions);
         let stop = Arc::clone(&stop);
         let config = Arc::clone(&config);
-        let num_slots = num_slots;
 
         thread::spawn(move || {
             barrier.wait();
@@ -444,7 +474,12 @@ fn full_pipeline_burst() {
                                 let resp_body = vec![0xFF_u8; 32];
 
                                 match region::write_response(
-                                    &region, i, 200, &resp_bytes, &resp_body, &config,
+                                    &region,
+                                    i,
+                                    200,
+                                    &resp_bytes,
+                                    &resp_body,
+                                    &config,
                                 ) {
                                     Ok(_) => {
                                         responded.fetch_add(1, Ordering::Relaxed);
@@ -476,7 +511,6 @@ fn full_pipeline_burst() {
         let corruptions = Arc::clone(&corruptions);
         let stop = Arc::clone(&stop);
         let config = Arc::clone(&config);
-        let num_slots = num_slots;
 
         thread::spawn(move || {
             barrier.wait();
@@ -515,12 +549,7 @@ fn full_pipeline_burst() {
                     // CAS Done → Free (same as shm.rs)
                     if slot
                         .status
-                        .compare_exchange(
-                            SLOT_DONE,
-                            SLOT_FREE,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
+                        .compare_exchange(SLOT_DONE, SLOT_FREE, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
                         freed_any = true;
@@ -543,8 +572,12 @@ fn full_pipeline_burst() {
         thread::sleep(Duration::from_secs(30));
     });
 
-    h_hub.join().expect("hub thread panicked (access violation?)");
-    h_hub2.join().expect("hub2 thread panicked (access violation?)");
+    h_hub
+        .join()
+        .expect("hub thread panicked (access violation?)");
+    h_hub2
+        .join()
+        .expect("hub2 thread panicked (access violation?)");
 
     // Wait for worker and watcher to drain
     let drain_start = std::time::Instant::now();
@@ -558,8 +591,12 @@ fn full_pipeline_burst() {
 
     // Signal stop for worker/watcher threads
     stop.store(true, Ordering::Relaxed);
-    h_worker.join().expect("worker thread panicked (access violation?)");
-    h_watcher.join().expect("watcher thread panicked (access violation?)");
+    h_worker
+        .join()
+        .expect("worker thread panicked (access violation?)");
+    h_watcher
+        .join()
+        .expect("watcher thread panicked (access violation?)");
 
     let d = dispatched.load(Ordering::Relaxed);
     let r = responded.load(Ordering::Relaxed);

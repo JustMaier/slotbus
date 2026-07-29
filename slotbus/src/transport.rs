@@ -427,8 +427,7 @@ impl SlotWorker {
             Err(e) => {
                 // Response write failed — free the slot to prevent permanent stall.
                 let slot = unsafe { self.region.slot(slot_index) };
-                slot.status
-                    .store(SLOT_FREE, Ordering::Release);
+                slot.status.store(SLOT_FREE, Ordering::Release);
                 Err(e)
             }
         }
