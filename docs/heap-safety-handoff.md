@@ -126,3 +126,86 @@ need 76533, have 4096 (stale same-name mapping still open)
 Falsified by reverting the naming to pre-fix behaviour: 4 of the 6 fail, each with the original production error text. The other 2 are pure encoding/`create_exclusive` checks that are independent of naming.
 
 **Still open:** items A/B — the shared inline-heap reset race. Generation stamping does not touch it.
+
+---
+
+## 7. `heap full` — mechanism established, and it is not the overflow leak
+
+The `heap full for request/response meta` errors are a **separate fault from the
+overflow-region problem in §6**, with a different cause. Tests:
+`slotbus/tests/heap_exhaustion.rs`.
+
+### The hypothesis that was wrong
+
+It was reasonable to suspect a shared cause: a leaked `SlotWorker` pins a slot
+non-FREE, `has_inflight_slots()` therefore always reports true, `try_reset_heap`
+never fires, and the heap fills. Both symptoms first appeared the same night,
+which made one root cause attractive.
+
+**Refuted.** A leaked worker's `overflow_regions` map holds handles to *separate
+named mappings* (`*-req-N` / `*-rsp-N`). Slot status lives in the control region
+and is written only by the protocol. `holding_overflow_handles_does_not_pin_any_slot`
+holds four overflow regions open, proves they are live by reading them back, and
+shows `has_inflight_slots()` is still false and `try_reset_heap` still reclaims.
+Holding overflow handles cannot veto a reset.
+
+The live system corroborates it: during the burst window the agent worker's
+64 slots were all FREE, in the same process that had just logged `heap full`,
+with no restart in between. A permanent pin cannot produce a symptom that
+recovers on its own — and every observed burst did recover.
+
+### The actual mechanism
+
+`alloc_heap` is a bump allocator. `alloc_head` only moves forward; there is no
+per-slot free. The single reclamation path is `reset_heap`, and `try_reset_heap`
+calls it **only when every slot is simultaneously FREE**.
+
+Reclamation therefore requires *global quiescence*. Under sustained overlapping
+traffic that instant may simply never arrive, and the allocator marches to the
+end of the heap. No leak, no stuck slot, and no bug is required — only overlap.
+
+`sustained_overlap_exhausts_heap_with_no_leak_anywhere` demonstrates it: every
+slot it claims it also frees, nothing outside the test holds a handle, and
+`try_reset_heap` is attempted on **every** iteration exactly as `dispatch` does.
+The reset is vetoed each time by whichever slot is still busy. Result: **137
+cycles to exhaustion.** The control,
+`quiescence_reclaims_the_heap_and_the_same_workload_survives`, runs the identical
+geometry and payload with full release between cycles and survives **5,000**
+cycles — 36× more — because the reset actually fires.
+
+That contrast is the falsification: overlap is the whole difference.
+
+`a_stuck_slot_vetoes_the_reset_permanently` records that a genuinely stuck slot
+*does* block the reset forever. That mechanism is real; it just is not what the
+overflow leak does.
+
+### Consequence for the ranked fixes in §3
+
+- **Item B makes this worse, not better.** Gating the reset on an additional
+  `active_readers == 0` condition makes it fire *less* often. B addresses the
+  corruption race; it cannot address exhaustion.
+- **Item A (per-slot heap arenas) is the only listed fix that resolves it.**
+  Giving each slot its own sub-range, reset when that slot goes FREE, removes
+  the global-quiescence requirement entirely.
+
+**Tradeoff on A, which is why it is not shipped here.** Splitting the heap
+`num_slots` ways shrinks the largest inline payload by the same factor — at the
+production geometry below, from ~1 MiB to ~16 KiB per slot. Payloads between
+those sizes would newly spill to overflow. That is a behaviour change for every
+downstream worker, and it shifts load onto the overflow path that §6 has only
+just stabilised. Arena sizing (equal split vs. configurable) is a design
+decision for the owner, not something to land unilaterally.
+
+### Operational lever, no code change
+
+Production runs `--slots 64` against the default `--region-size 1048576`, giving
+`compute_layout(64, 1 MiB)` → ~1016 KiB of heap shared by 64 slots.
+
+Note the interaction: **raising `--slots` makes exhaustion more likely, not
+less.** More slots means a lower probability that *all* of them are
+simultaneously FREE, while the heap stays the same size. The hub is running
+double the slotbus default of 32 with an unchanged 1 MiB region.
+
+Raising `--region-size` buys proportionally more allocations between quiescence
+windows. It does not fix the class, but it is one flag, no code, and no protocol
+risk — worth doing before any redesign.
