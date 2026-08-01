@@ -1,6 +1,6 @@
 # slotbus — heap-safety hardening handoff
 
-**Status:** heap read/write guards shipped (0.1.3); overflow-region generation stamping shipped (§6). Root trigger of the underlying heap race still not confirmed with a crash dump — items A/B remain. This doc is for whoever picks up the permanent fix.
+**Status:** heap read/write guards shipped (0.1.3); overflow-region generation stamping shipped (§6); per-slot heap arenas shipped (§8), which closes item A and the `heap full` class in §7. Item B is moot — see §8. The original 0xC0000005 was never confirmed against a crash dump, but the two mechanisms that could produce it have both been removed by construction.
 
 **Context:** A downstream hub worker (`agent-server` in the ai-notifications project) crash-looped with Windows exit code `3221225477` = `0xC0000005` (ACCESS_VIOLATION), ~once a minute, under a high-churn reconnect storm (two clients fighting over one identity → rapid concurrent `dispatch` + slot reuse + a 3s reaper running alongside). The access violation signature points at a wild pointer deref in `unsafe` SHM code, not safe Rust.
 
@@ -45,9 +45,9 @@ Static analysis is inconclusive on the exact faulting deref. Capture it:
 
 ## 3. Recommended permanent fix (ranked)
 
-**A. Remove the shared-reset hazard by design (preferred).** The inline heap is one bump allocator shared by all slots, reset based on global slot state — inherently cross-coupled. Replace with **per-slot heap arenas**: give each slot a fixed heap sub-range it owns; write/read only within it; never reset globally. Eliminates every cross-slot reset/reuse race at once. Larger change, but kills the class.
+**A. Remove the shared-reset hazard by design (preferred).** ✅ **SHIPPED — see §8.** The inline heap is one bump allocator shared by all slots, reset based on global slot state — inherently cross-coupled. Replace with **per-slot heap arenas**: give each slot a fixed heap sub-range it owns; write/read only within it; never reset globally. Eliminates every cross-slot reset/reuse race at once. Larger change, but kills the class.
 
-**B. If keeping the shared heap:** gate `reset_heap` behind an explicit active-reader count (AtomicUsize incremented around `read_request`/`read_response`, transport.rs:226 and :472) AND have readers load `alloc_head` with `Acquire` so there's a real happens-before. `try_reset_heap` resets only when `!has_inflight_slots() && active_readers == 0`.
+**B. If keeping the shared heap:** ❌ **Moot, and it would have made §7 worse** — it gates the reset on an *additional* condition, so it fires less often. Superseded by A. gate `reset_heap` behind an explicit active-reader count (AtomicUsize incremented around `read_request`/`read_response`, transport.rs:226 and :472) AND have readers load `alloc_head` with `Acquire` so there's a real happens-before. `try_reset_heap` resets only when `!has_inflight_slots() && active_readers == 0`.
 
 **C. ~~Bound the overflow read path~~ — NOT NEEDED, the claim was wrong.** See §2a item 1: `read_overflow` has been bounds-checked since the initial release. No work to do.
 
@@ -209,3 +209,83 @@ double the slotbus default of 32 with an unchanged 1 MiB region.
 Raising `--region-size` buys proportionally more allocations between quiescence
 windows. It does not fix the class, but it is one flag, no code, and no protocol
 risk — worth doing before any redesign.
+
+---
+
+## 8. Per-slot heap arenas (shipped — item A)
+
+Closes the `heap full` class described in §7, and with it the shared-reset
+hazard that §2a spent so long failing to pin down.
+
+**Design.** The inline heap is divided into `num_slots` equal arenas, one per
+slot. Each arena is split in half — request payload in the first, response in
+the second — and placement inside a half is fixed: metadata at offset 0, body
+immediately after it, 8-byte aligned. There is no allocator state anywhere, so
+there is nothing to reclaim and no quiescence to wait for. A slot rewrites the
+same bytes every cycle, which is correct precisely because it owns them.
+
+Splitting request from response, rather than letting a slot's response reuse the
+whole arena, means a response write can never disturb request bytes regardless
+of whether a reader has finished with them. That costs half the ceiling and buys
+independence from read-completion ordering — a trade worth making in code whose
+last three bugs were all ordering assumptions that turned out to be wrong.
+
+**The global machinery is retired, not removed.** `alloc_heap`, `reset_heap` and
+`try_reset_heap` are `#[deprecated]` rather than deleted: they are `pub` on a
+published crate, so removing them would force a 0.2.0. Nothing in the protocol
+calls them now, and `transport.rs` no longer attempts a reset at dispatch or in
+the response watcher. `has_inflight_slots` is **not** deprecated — it is still
+sound and useful for diagnostics. Callers should know that offsets from
+`alloc_heap` now overlap live slot arenas and will corrupt them if written to;
+the deprecation note says so.
+
+**SHM_VERSION 1 → 2, deliberately.** The struct layout is byte-identical between
+the two designs, and both record absolute heap offsets in the slot, so *reads*
+would interoperate — which is exactly why the version had to change. A v1 writer
+bump-allocates from the shared `alloc_head` and will hand out an offset that
+lands inside a v2 writer's arena. The two then scribble over each other with no
+error raised anywhere. `validate_control` now rejects the mismatch outright, so
+a stale peer fails loudly at startup instead of corrupting payloads silently.
+
+**Rollout consequence: every peer must be rebuilt in lockstep** — hub,
+agent-server, tts-server, stt-server, discord-bridge, and the Tauri app. Unlike
+the generation stamping in §6, this one cannot degrade gracefully. A worker that
+misses the rebuild will fail to open the region with `bad version: expected 2,
+got 1` rather than misbehaving quietly. That is the intended outcome.
+
+**The inline ceiling drops. This is the real cost.** Bodies above it spill to an
+overflow region, which is ordinary supported behaviour — and that path is the
+one §6 stabilised, with a 51-hour production soak behind it.
+
+| Geometry | Arena | Per-half | Inline body ceiling¹ |
+|---|---|---|---|
+| hub today: `--slots 64 --region-size 4MiB` | 65,400 | ~32.7 KiB | **~32,184 B** |
+| hub before the region-size raise (1 MiB) | 16,248 | ~8.1 KiB | ~7,608 B |
+| slotbus defaults: 32 slots, 1 MiB | 32,632 | ~16.3 KiB | ~15,800 B |
+
+¹ assuming a 512-byte serialized metadata blob, which is generous for a hub route.
+
+Previously any single payload could use the whole heap (~4 MB at production
+geometry) provided no other slot needed it at that moment. That headroom was
+never dependable — it was exactly the coupling that caused the exhaustion. The
+ceiling is now small but *guaranteed*, and it scales linearly with
+`--region-size`.
+
+**Evidence.** `slotbus/tests/heap_exhaustion.rs`:
+
+- `sustained_overlap_no_longer_exhausts_heap` — the §7 exhaustion test, same
+  geometry and same overlap discipline, assertions inverted. 10,000 cycles, no
+  exhaustion.
+- `one_slots_traffic_cannot_starve_another` — 5,000 cycles hammering slot 0,
+  then slot 3 writes and round-trips intact.
+- `body_too_large_for_its_arena_spills_to_overflow_and_round_trips` — the new
+  boundary, exercised directly.
+- `slot_arenas_are_disjoint_and_within_the_heap` — the arenas tile the heap with
+  no gap, no overlap, no run-off, all 8-byte aligned.
+
+Falsified rather than assumed: reverting *only* the request write path to
+`alloc_heap` fails three of these, and `sustained_overlap_no_longer_exhausts_heap`
+reports exhaustion at **137 cycles** — the identical number §7 measured against
+the original allocator. The tests carry their own vacuity guards, including one
+asserting `alloc_head` never leaves 0, which catches any write path that quietly
+goes back to allocating globally.

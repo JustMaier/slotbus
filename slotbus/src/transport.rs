@@ -138,9 +138,8 @@ impl SlotBus {
         meta: &RequestMeta,
         body: &[u8],
     ) -> Result<oneshot::Receiver<Response>, SlotBusError> {
-        // Try to reclaim heap space
-        self.region.try_reset_heap();
-
+        // No heap reclamation step: each slot writes into its own arena, so
+        // there is no shared allocator to reclaim and no quiescence to wait for.
         let slot_index = region::claim_free_slot(&self.region)
             .ok_or(SlotBusError::NoFreeSlots(self.config.num_slots))?;
 
@@ -205,8 +204,6 @@ impl SlotBus {
                     }
                     rsp_event.wait_timeout(config.wait_timeout_ms);
 
-                    let mut freed_any = false;
-
                     for i in 0..region.num_slots() {
                         let slot = unsafe { region.slot(i) };
 
@@ -240,7 +237,6 @@ impl SlotBus {
                             continue;
                         }
 
-                        freed_any = true;
                         overflow_regions.lock().unwrap().remove(&i);
 
                         match resp_result {
@@ -264,10 +260,6 @@ impl SlotBus {
                                 warn!(slot = i, error = %e, "failed to read response");
                             }
                         }
-                    }
-
-                    if freed_any {
-                        region.try_reset_heap();
                     }
                 }
             })
