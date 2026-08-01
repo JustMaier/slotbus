@@ -205,10 +205,33 @@ impl ShmRegion {
         }
     }
 
+    /// Heap-relative `(offset, len)` of this slot's request and response
+    /// sub-arenas, as `(request, response)`.
+    ///
+    /// Every payload for a slot is written inside the bytes this returns, so
+    /// slots never contend for space. See [`crate::types::slot_arenas`].
+    pub fn slot_arenas(&self, slot_index: usize) -> ((usize, usize), (usize, usize)) {
+        crate::types::slot_arenas(slot_index, self.num_slots, self.heap_size)
+    }
+
+    /// Largest body that fits inline alongside a `meta_len`-byte metadata
+    /// blob, for either direction of a slot. Bodies above this spill to an
+    /// overflow region.
+    pub fn inline_body_capacity(&self, meta_len: usize) -> usize {
+        let ((_, req), (_, resp)) = self.slot_arenas(0);
+        req.min(resp).saturating_sub(align8(meta_len))
+    }
+
     /// Allocate `size` bytes from the inline heap (bump allocator).
     ///
     /// Returns the heap offset, or `None` if the heap is full.
     /// Thread-safe via CAS on `alloc_head`.
+    #[deprecated(
+        since = "0.1.4",
+        note = "the protocol no longer uses a shared bump allocator; payloads are placed in \
+                per-slot arenas (see ShmRegion::slot_arenas). Offsets returned here overlap \
+                those arenas and will corrupt live slots if written to."
+    )]
     pub fn alloc_heap(&self, size: usize) -> Option<u32> {
         let aligned = (size + 7) & !7; // align to 8 bytes
         let header = unsafe { self.header() };
@@ -234,6 +257,10 @@ impl ShmRegion {
     }
 
     /// Reset the heap allocator to zero. Only safe when all slots are Free.
+    #[deprecated(
+        since = "0.1.4",
+        note = "per-slot arenas need no reclamation; this only moves the now-unused alloc_head"
+    )]
     pub fn reset_heap(&self) {
         let header = unsafe { self.header() };
         header.alloc_head.store(0, Ordering::Release);
@@ -251,8 +278,19 @@ impl ShmRegion {
     }
 
     /// Try to reset heap if no slots are in-flight.
+    ///
+    /// This was the only path that reclaimed inline-heap space, and it fired
+    /// only on global quiescence — every slot FREE at the same instant. Under
+    /// sustained overlap that instant may never arrive, which is how the heap
+    /// used to exhaust with no leak involved. Per-slot arenas removed the need
+    /// for it entirely; the protocol no longer calls it.
+    #[deprecated(
+        since = "0.1.4",
+        note = "per-slot arenas need no reclamation; this is now a no-op on live traffic"
+    )]
     pub fn try_reset_heap(&self) {
         if !self.has_inflight_slots() {
+            #[allow(deprecated)]
             self.reset_heap();
         }
     }
@@ -485,6 +523,18 @@ pub fn find_free_slot(region: &ShmRegion) -> Option<usize> {
 
 // ---- Write helpers -----------------------------------------------------------
 
+/// Where a body goes inside a sub-arena that already holds `meta_len` bytes of
+/// metadata, or `None` if it does not fit and must spill to overflow.
+///
+/// The body sits immediately after the metadata, 8-byte aligned. Both are at
+/// fixed positions within bytes the slot owns outright, so this is placement
+/// rather than allocation — there is no head to advance and nothing to free.
+fn arena_body_offset(base: usize, size: usize, meta_len: usize, body_len: usize) -> Option<u32> {
+    let start = base + align8(meta_len);
+    let end = start.checked_add(body_len)?;
+    (end <= base + size).then_some(start as u32)
+}
+
 /// Write request data into a slot + heap (or overflow).
 ///
 /// The slot must already be in `Writing` state (reserved via [`claim_free_slot`]).
@@ -540,10 +590,17 @@ fn write_request_inner(
         slot_ptr.add(40).write(method);
     }
 
-    // Allocate and write metadata into heap
-    let meta_offset = region
-        .alloc_heap(meta_bytes.len())
-        .ok_or_else(|| SlotBusError::SharedMemory("heap full for request meta".into()))?;
+    // Place metadata at the start of this slot's request arena. Fixed
+    // placement, not allocation: the bytes belong to this slot alone, so
+    // rewriting them every cycle is correct and nothing accumulates.
+    let ((req_base, req_size), _) = region.slot_arenas(slot_index);
+    if meta_bytes.len() > req_size {
+        return Err(SlotBusError::SharedMemory(format!(
+            "heap full for request meta: need {}, slot arena holds {req_size}",
+            meta_bytes.len()
+        )));
+    }
+    let meta_offset = req_base as u32;
     region.heap_write_checked(meta_offset, meta_bytes)?;
 
     // Write meta pointer fields
@@ -566,7 +623,9 @@ fn write_request_inner(
             (slot_ptr.add(56) as *mut u32).write(0);
             slot_ptr.add(60).write(0);
         }
-    } else if let Some(body_offset) = region.alloc_heap(body.len()) {
+    } else if let Some(body_offset) =
+        arena_body_offset(req_base, req_size, meta_bytes.len(), body.len())
+    {
         region.heap_write_checked(body_offset, body)?;
         unsafe {
             let slot_ptr = region
@@ -625,10 +684,17 @@ pub fn write_response(
         (slot_ptr.add(64) as *mut u16).write(status);
     }
 
-    // Allocate and write response metadata
-    let meta_offset = region
-        .alloc_heap(meta_bytes.len())
-        .ok_or_else(|| SlotBusError::SharedMemory("heap full for response meta".into()))?;
+    // Place response metadata at the start of this slot's response arena. The
+    // response half is disjoint from the request half, so this cannot disturb
+    // request bytes even if a reader is still holding them.
+    let (_, (resp_base, resp_size)) = region.slot_arenas(slot_index);
+    if meta_bytes.len() > resp_size {
+        return Err(SlotBusError::SharedMemory(format!(
+            "heap full for response meta: need {}, slot arena holds {resp_size}",
+            meta_bytes.len()
+        )));
+    }
+    let meta_offset = resp_base as u32;
     region.heap_write_checked(meta_offset, meta_bytes)?;
 
     unsafe {
@@ -650,7 +716,9 @@ pub fn write_response(
             (slot_ptr.add(80) as *mut u32).write(0);
             slot_ptr.add(84).write(0);
         }
-    } else if let Some(body_offset) = region.alloc_heap(body.len()) {
+    } else if let Some(body_offset) =
+        arena_body_offset(resp_base, resp_size, meta_bytes.len(), body.len())
+    {
         region.heap_write_checked(body_offset, body)?;
         unsafe {
             let slot_ptr = region

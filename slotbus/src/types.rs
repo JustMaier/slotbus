@@ -13,7 +13,17 @@ use serde::{Deserialize, Serialize};
 pub const SHM_MAGIC: u32 = 0x534C4231;
 
 /// Current protocol version.
-pub const SHM_VERSION: u32 = 1;
+///
+/// Bumped 1 → 2 when the inline heap changed from a globally shared bump
+/// allocator to fixed per-slot arenas (see [`slot_arenas`]). The struct layout
+/// is byte-identical across the two, and both record absolute heap offsets in
+/// the slot, so *reads* would interoperate — which is exactly why the version
+/// has to change. A v1 writer bump-allocates from the shared `alloc_head` and
+/// will happily hand out an offset that lands inside a v2 writer's arena, so a
+/// mixed pair corrupts each other's payloads with no error anywhere. Failing
+/// loudly in [`validate_control`](crate::region::ShmRegion::validate_control)
+/// is far better than that silence.
+pub const SHM_VERSION: u32 = 2;
 
 /// Size of `SlotMeta` in bytes (compile-time verified).
 pub const SLOT_META_SIZE: usize = 128;
@@ -115,6 +125,61 @@ pub fn compute_layout(num_slots: usize, region_size: usize) -> (usize, usize) {
     let heap_offset = SHM_HEADER_SIZE + (num_slots * SLOT_META_SIZE);
     let heap_size = region_size.saturating_sub(heap_offset);
     (heap_offset, heap_size)
+}
+
+// ---- Per-slot heap arenas ----------------------------------------------------
+//
+// The inline heap is divided into `num_slots` equal arenas, one per slot, and
+// each arena is split in half: the first half holds the request payload, the
+// second the response. Placement inside a half is fixed — metadata at offset 0,
+// body immediately after it, 8-byte aligned — so there is no allocator state
+// anywhere and nothing to reclaim.
+//
+// This replaces a single bump allocator shared by every slot. That design could
+// only reclaim space by resetting `alloc_head` to zero, which was safe only
+// while every slot was simultaneously FREE. Under sustained overlap that
+// instant may never arrive, so the head marched to the end of the heap and
+// every subsequent write failed with "heap full for response meta" — an
+// exhaustion that needed no leak and no bug to occur, just traffic.
+//
+// Each slot now writes only within bytes it owns, so one slot's traffic cannot
+// consume another's space and no global quiescence is ever required. The cost
+// is a smaller inline ceiling: a body that does not fit its half spills to an
+// overflow region, which is ordinary supported behaviour.
+
+/// Byte length of one slot's arena.
+///
+/// Returns 0 if `num_slots` is 0 or the heap is too small to divide.
+pub fn arena_size(num_slots: usize, heap_size: usize) -> usize {
+    if num_slots == 0 {
+        return 0;
+    }
+    // Round down to 8 so every arena — and therefore every sub-arena base —
+    // starts 8-byte aligned without per-slot fixups.
+    (heap_size / num_slots) & !7
+}
+
+/// Heap-relative `(offset, len)` of the request and response halves of a
+/// slot's arena, as `(request, response)`.
+///
+/// Splitting the arena rather than sharing it across both directions means the
+/// response write can never disturb request bytes, regardless of whether the
+/// reader has finished with them. That independence is what makes the placement
+/// safe without any cross-process coordination.
+pub fn slot_arenas(
+    slot_index: usize,
+    num_slots: usize,
+    heap_size: usize,
+) -> ((usize, usize), (usize, usize)) {
+    let arena = arena_size(num_slots, heap_size);
+    let base = slot_index * arena;
+    let half = (arena / 2) & !7;
+    ((base, half), (base + half, arena - half))
+}
+
+/// Round `n` up to the next multiple of 8.
+pub fn align8(n: usize) -> usize {
+    (n + 7) & !7
 }
 
 // ---- #[repr(C)] shared memory structs ----------------------------------------

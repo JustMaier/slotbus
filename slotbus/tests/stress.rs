@@ -9,6 +9,10 @@
 //! 2. try_reset_heap can zero the heap while another thread is mid-write
 //! 3. Heap bump allocator hands out the same offset after a reset race
 
+// Exercises the retired shared-allocator API on purpose, to pin down the
+// legacy races it was subject to. Deprecation warnings are expected.
+#![allow(deprecated)]
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
