@@ -218,7 +218,7 @@ impl ShmRegion {
     /// Returns the heap offset, or `None` if the heap is full.
     /// Thread-safe via CAS on `alloc_head`.
     #[deprecated(
-        since = "0.1.4",
+        since = "0.2.0",
         note = "the protocol no longer uses a shared bump allocator; payloads are placed in \
                 per-slot arenas (see ShmRegion::slot_arenas). Offsets returned here overlap \
                 those arenas and will corrupt live slots if written to."
@@ -249,7 +249,7 @@ impl ShmRegion {
 
     /// Reset the heap allocator to zero. Only safe when all slots are Free.
     #[deprecated(
-        since = "0.1.4",
+        since = "0.2.0",
         note = "per-slot arenas need no reclamation; this only moves the now-unused alloc_head"
     )]
     pub fn reset_heap(&self) {
@@ -276,7 +276,7 @@ impl ShmRegion {
     /// used to exhaust with no leak involved. Per-slot arenas removed the need
     /// for it entirely; the protocol no longer calls it.
     #[deprecated(
-        since = "0.1.4",
+        since = "0.2.0",
         note = "per-slot arenas need no reclamation; this is now a no-op on live traffic"
     )]
     pub fn try_reset_heap(&self) {
