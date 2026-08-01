@@ -95,7 +95,7 @@ impl SlotBus {
     pub fn create(config: SlotBusConfig) -> Result<Self, SlotBusError> {
         let region_name = config.region_name();
         let mut region = ShmRegion::create_or_open(&region_name, config.region_size)?;
-        region.init_control(&config);
+        region.init_control(&config)?;
 
         let req_event = NamedEvent::create(&config.request_event_name())?;
         let rsp_event = NamedEvent::create(&config.response_event_name())?;

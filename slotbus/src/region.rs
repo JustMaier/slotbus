@@ -77,25 +77,16 @@ impl ShmRegion {
 
     /// Try to create; if already exists, open instead.
     pub fn create_or_open(name: &str, size: usize) -> Result<Self, SlotBusError> {
-        match ShmemConf::new().os_id(name).size(size).create() {
-            Ok(shmem) => {
-                let ptr = shmem.as_ptr();
-                let len = shmem.len();
-                Ok(Self {
-                    _shmem: shmem,
-                    ptr,
-                    len,
-                    name: name.to_string(),
-                    num_slots: 0,
-                    heap_offset: 0,
-                    heap_size: 0,
-                })
-            }
-            Err(ShmemError::MappingIdExists) => Self::open(name),
-            Err(e) => Err(SlotBusError::SharedMemory(format!(
-                "create_or_open '{name}': {e}"
-            ))),
+        // Exclusive create first, so an orphaned backing file left by a killed
+        // process is reclaimed rather than adopted. Adoption is the dangerous
+        // case: the surviving mapping keeps the size it was *originally*
+        // created with, so a caller that asked for a larger region silently
+        // gets a smaller one. See `init_control`, which refuses to lay a
+        // requested layout into a mapping too small to hold it.
+        if let Some(region) = Self::create_exclusive(name, size)? {
+            return Ok(region);
         }
+        Self::open(name)
     }
 
     /// The OS-level name of this region.
@@ -298,8 +289,26 @@ impl ShmRegion {
     // ---- Control region: initialization --------------------------------------
 
     /// Initialize a freshly-created control region with the given config.
-    pub fn init_control(&mut self, config: &SlotBusConfig) {
+    pub fn init_control(&mut self, config: &SlotBusConfig) -> Result<(), SlotBusError> {
         let (heap_offset, heap_size) = compute_layout(config.num_slots, config.region_size);
+
+        // The layout is derived from the REQUESTED region_size, but `self.len`
+        // is what we actually mapped, and those differ whenever an existing
+        // smaller mapping was adopted (a stale region from before a size
+        // increase, say). Writing the requested layout into the header anyway
+        // would advertise a heap larger than the mapping — and every bounds
+        // check validates against the header, so they would wave through writes
+        // running off the end of the mapping. Fail loudly instead.
+        let needed = heap_offset + heap_size;
+        if needed > self.len {
+            return Err(SlotBusError::InvalidRegion(format!(
+                "region '{}' maps {} bytes but the requested layout needs {} \
+                 (num_slots={}, region_size={}); an existing smaller mapping was adopted — \
+                 stop every peer and remove the stale region before retrying",
+                self.name, self.len, needed, config.num_slots, config.region_size
+            )));
+        }
+
         self.num_slots = config.num_slots;
         self.heap_offset = heap_offset;
         self.heap_size = heap_size;
@@ -320,6 +329,7 @@ impl ShmRegion {
         }
         let header = unsafe { self.header() };
         header.alloc_head.store(0, Ordering::Release);
+        Ok(())
     }
 
     /// Validate that a control region has the correct magic/version and read layout.
@@ -340,6 +350,20 @@ impl ShmRegion {
             if version != SHM_VERSION {
                 return Err(SlotBusError::InvalidRegion(format!(
                     "bad version: expected {SHM_VERSION}, got {version}"
+                )));
+            }
+            // The header describes the layout, and every bounds check validates
+            // against the header — so a header describing more space than the
+            // mapping actually has turns those checks into rubber stamps for
+            // out-of-bounds accesses. Refuse such a region outright.
+            if heap_offset + heap_size > self.len {
+                return Err(SlotBusError::InvalidRegion(format!(
+                    "region '{}' maps {} bytes but its header describes a layout ending at {} \
+                     (heap_offset={heap_offset}, heap_size={heap_size}); \
+                     the region was created against a larger region_size",
+                    self.name,
+                    self.len,
+                    heap_offset + heap_size
                 )));
             }
 
@@ -376,38 +400,120 @@ impl ShmRegion {
     /// Best-effort by design: any failure returns false, leaving the caller on
     /// its existing fallback path.
     #[cfg(windows)]
+    fn backing_file_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join("shared_memory-rs")
+    }
+
+    /// Resolve `name` to the backing file it would occupy, or `None` if the
+    /// name could not name a file *directly inside* the backing directory.
+    ///
+    /// This function guards a delete, and region names are attacker-reachable:
+    /// a hub takes the worker's requested name straight from its registration
+    /// request. `Path::join` is not safe on untrusted input — `..` walks up out
+    /// of the directory, and an absolute path replaces the base outright.
+    ///
+    /// A backing file always sits directly in the backing directory, so a
+    /// legitimate name is exactly **one normal path component**. Anything with
+    /// separators, a `..`, a root, or a drive prefix is rejected rather than
+    /// normalised, because there is no legitimate name that needs them.
+    #[cfg(windows)]
+    fn backing_file_path(name: &str) -> Option<std::path::PathBuf> {
+        use std::path::{Component, Path};
+
+        let trimmed = name.trim_start_matches('/');
+
+        let mut components = Path::new(trimmed).components();
+        match (components.next(), components.next()) {
+            (Some(Component::Normal(_)), None) => Some(Self::backing_file_dir().join(trimmed)),
+            _ => None,
+        }
+    }
+
+    #[cfg(windows)]
     fn reclaim_orphaned_backing_file(name: &str) -> bool {
         use std::os::windows::fs::OpenOptionsExt;
 
-        let path = std::env::temp_dir()
-            .join("shared_memory-rs")
-            .join(name.trim_start_matches('/'));
+        /// `DELETE` access right.
+        const DELETE: u32 = 0x0001_0000;
+        /// Unlink the file when the last handle to it closes.
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+        /// Open a reparse point itself instead of following it.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
-        // share_mode(0) => fail if ANY other handle is open on this file.
+        let Some(path) = Self::backing_file_path(name) else {
+            tracing::warn!(
+                region = name,
+                "refusing to reclaim: region name is not a single path component"
+            );
+            return false;
+        };
+
+        // Resolve links before trusting the location, then require the resolved
+        // parent to be exactly the backing directory. Canonicalising the file
+        // (rather than checking the name alone) also collapses any junction or
+        // symlink planted inside the directory to its real target, which would
+        // then fail this check.
+        let (Ok(resolved), Ok(dir)) =
+            (path.canonicalize(), Self::backing_file_dir().canonicalize())
+        else {
+            // A missing file is the common case: nothing to reclaim.
+            return false;
+        };
+        if resolved.parent() != Some(dir.as_path()) {
+            tracing::warn!(
+                region = name,
+                path = %resolved.display(),
+                "refusing to reclaim a backing file outside the backing directory"
+            );
+            return false;
+        }
+
+        // share_mode(0) => fail if ANY other handle is open on this file. Every
+        // live user, creator or opener, holds its backing-file handle for the
+        // whole lifetime of the mapping, so this succeeds only when the file is
+        // genuinely orphaned.
+        //
+        // DELETE_ON_CLOSE makes the unlink atomic with that exclusive open.
+        // Deleting via a separate `remove_file` would run *after* the handle
+        // dropped, so another process could reclaim the same name and create a
+        // fresh file in between — which we would then delete out from under it,
+        // leaving it with a live mapping no peer could ever open by name.
         match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
+            .access_mode(DELETE)
             .share_mode(0)
-            .open(&path)
+            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&resolved)
         {
             Ok(file) => {
                 drop(file);
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {
-                        tracing::warn!(
-                            region = name,
-                            path = %path.display(),
-                            "removed orphaned shared-memory backing file left by a killed process"
-                        );
-                        true
-                    }
-                    Err(_) => false,
-                }
+                tracing::warn!(
+                    region = name,
+                    path = %resolved.display(),
+                    "removed orphaned shared-memory backing file left by a killed process"
+                );
+                true
             }
             Err(_) => false,
         }
     }
 
+    /// Always `false` on Unix: orphaned POSIX shared memory is **not** reclaimed.
+    ///
+    /// Known limitation, deliberately not papered over. The Windows reclaim
+    /// works because an exclusive `CreateFileW` distinguishes "in use" from
+    /// "orphaned" atomically, as a property the OS enforces. POSIX
+    /// `shm_open` has no equivalent: there are no share modes, slotbus takes no
+    /// advisory lock a live peer would hold, and a segment carries nothing that
+    /// proves its owner is alive. Inferring liveness — scanning `/proc/*/fd`,
+    /// or trusting a PID written into the header — is racy and Linux-only, and
+    /// guessing wrong here **deletes a live region**. A wrong reclaim is far
+    /// worse than no reclaim, so Unix keeps the leak.
+    ///
+    /// Consequence: on Linux and macOS a hard-killed process leaves its segment
+    /// in `/dev/shm` (or the macOS equivalent) forever, and each orphan
+    /// permanently burns one overflow generation. Callers relying on generation
+    /// stamping will walk further on each restart. Clean up out of band, e.g.
+    /// `rm /dev/shm/<prefix>-*` on boot.
     #[cfg(not(windows))]
     fn reclaim_orphaned_backing_file(_name: &str) -> bool {
         false
@@ -468,7 +574,8 @@ impl ShmRegion {
         let size = Self::overflow_size_for(data.len());
         let Some(region) = Self::create_exclusive(name, size)? else {
             return Err(SlotBusError::SharedMemory(format!(
-                "overflow region '{name}' already exists: need {} bytes (stale same-name mapping still open)",
+                "overflow region '{name}' already exists: need {} bytes \
+                 (held by a live peer, or an orphaned backing file that could not be reclaimed)",
                 data.len()
             )));
         };
@@ -507,7 +614,7 @@ impl ShmRegion {
 
         Err(SlotBusError::SharedMemory(format!(
             "exhausted all {} overflow generations for '{last_name}': need {} bytes \
-             (stale same-name mappings still open)",
+             (every generation is held by a live peer or an unreclaimable orphan)",
             MAX_OVERFLOW_GENERATION as u16 + 1,
             data.len()
         )))

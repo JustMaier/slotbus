@@ -22,7 +22,10 @@ use slotbus::region::{self, ShmRegion};
 use slotbus::types::*;
 use slotbus::SlotBusConfig;
 
+mod common;
+
 fn make_config(test: &str, num_slots: usize, region_size: usize) -> SlotBusConfig {
+    common::sweep_stale_test_backing_files();
     let name = format!("test-{}-{}", test, std::process::id());
     SlotBusConfig::builder()
         .name(&name)
@@ -34,7 +37,7 @@ fn make_config(test: &str, num_slots: usize, region_size: usize) -> SlotBusConfi
 
 fn create_region(config: &SlotBusConfig) -> ShmRegion {
     let mut region = ShmRegion::create(&config.region_name(), config.region_size).unwrap();
-    region.init_control(config);
+    region.init_control(config).expect("init_control");
     region
 }
 

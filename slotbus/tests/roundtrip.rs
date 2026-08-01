@@ -6,6 +6,8 @@
 //! receive loop threads to exit.
 
 use std::sync::atomic::{AtomicU32, Ordering};
+
+mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +20,7 @@ static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Helper: create a SlotBus + SlotWorker pair with a unique name.
 fn create_pair(test_name: &str, num_slots: usize) -> (SlotBus, Arc<SlotWorker>) {
+    common::sweep_stale_test_backing_files();
     let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     let name = format!("test-{}-{}-{}", test_name, std::process::id(), id);
 
