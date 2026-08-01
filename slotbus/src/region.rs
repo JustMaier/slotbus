@@ -319,12 +319,86 @@ impl ShmRegion {
         ((len + 4095) & !4095).max(4096)
     }
 
+    /// Try to reclaim an *orphaned* backing file for `name`, returning true if
+    /// one was removed.
+    ///
+    /// On Windows `shared_memory` backs every mapping with a real file under
+    /// `%TEMP%\shared_memory-rs\`, and reports `MappingIdExists` when that file
+    /// is present — whether or not anyone still has it mapped. Its cleanup runs
+    /// from `Drop`, so a hard process kill (SIGKILL, `TerminateProcess`, a
+    /// crash) leaves the file behind forever. The next run then adopts a stale
+    /// mapping frozen at its original size.
+    ///
+    /// Opening the file with no sharing tells the two cases apart. Every live
+    /// user — creator or opener — keeps the file handle open, so an exclusive
+    /// open fails with a sharing violation while anyone is still using it. It
+    /// succeeds only when the file is genuinely orphaned, and only then do we
+    /// delete it.
+    ///
+    /// Best-effort by design: any failure returns false, leaving the caller on
+    /// its existing fallback path.
+    #[cfg(windows)]
+    fn reclaim_orphaned_backing_file(name: &str) -> bool {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let path = std::env::temp_dir()
+            .join("shared_memory-rs")
+            .join(name.trim_start_matches('/'));
+
+        // share_mode(0) => fail if ANY other handle is open on this file.
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&path)
+        {
+            Ok(file) => {
+                drop(file);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        tracing::warn!(
+                            region = name,
+                            path = %path.display(),
+                            "removed orphaned shared-memory backing file left by a killed process"
+                        );
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+            Err(_) => false,
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn reclaim_orphaned_backing_file(_name: &str) -> bool {
+        false
+    }
+
     /// Create a named region, returning `Ok(None)` if the name is already taken.
     ///
     /// Unlike [`create_or_open`](Self::create_or_open) this never adopts a
     /// mapping created by someone else, so the caller can be certain the
     /// returned region has the size it asked for.
+    ///
+    /// If the name is taken only by an orphaned backing file (see
+    /// [`reclaim_orphaned_backing_file`](Self::reclaim_orphaned_backing_file)),
+    /// the file is removed and the create is retried once. Without that, every
+    /// hard kill permanently burns a name: callers using generation stamping
+    /// would walk one generation further on each restart until all 255 are
+    /// exhausted.
     fn create_exclusive(name: &str, size: usize) -> Result<Option<Self>, SlotBusError> {
+        if let Some(region) = Self::try_create_exclusive(name, size)? {
+            return Ok(Some(region));
+        }
+        if Self::reclaim_orphaned_backing_file(name) {
+            return Self::try_create_exclusive(name, size);
+        }
+        Ok(None)
+    }
+
+    /// One `create` attempt. `Ok(None)` means the name is already taken.
+    fn try_create_exclusive(name: &str, size: usize) -> Result<Option<Self>, SlotBusError> {
         match ShmemConf::new().os_id(name).size(size).create() {
             Ok(shmem) => {
                 let ptr = shmem.as_ptr();
