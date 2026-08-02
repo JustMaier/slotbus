@@ -1,8 +1,40 @@
-# slotbus — heap-safety hardening handoff
+# slotbus — heap-safety investigation (closed)
 
-**Status:** heap read/write guards shipped (0.1.3); overflow-region generation stamping shipped (§6); per-slot heap arenas shipped (§8), which closes item A and the `heap full` class in §7. Item B is moot — see §8. The original 0xC0000005 was never confirmed against a crash dump, but the two mechanisms that could produce it have both been removed by construction.
+**Status: resolved in 0.2.0.** This began as a handoff for open work and is kept
+as the record of how it was chased. Everything it proposed is either shipped or
+withdrawn — read it as history, not as a task list. Sections are preserved in the
+order they were written, including the parts that turned out to be wrong, because
+the wrong turns are the useful part.
 
-**Context:** A downstream hub worker (`agent-server` in the ai-notifications project) crash-looped with Windows exit code `3221225477` = `0xC0000005` (ACCESS_VIOLATION), ~once a minute, under a high-churn reconnect storm (two clients fighting over one identity → rapid concurrent `dispatch` + slot reuse + a 3s reaper running alongside). The access violation signature points at a wild pointer deref in `unsafe` SHM code, not safe Rust.
+**What it actually was.** Three independent faults, discovered in this order:
+
+1. **Orphaned backing files** (the root cause of the reported symptom).
+   `shared_memory` backs each mapping with a file that is removed only on a clean
+   `Drop`, so any hard kill leaks it. A later run adopted the stale mapping *at
+   its original size*, and a larger payload then wrote past the end. This is what
+   produced `too small for write: need 76533, have 4096` — and the guard's own
+   wording, *"stale same-name mapping still open"*, was wrong and sent three
+   separate investigations hunting for a live handle. Nothing was open. On the
+   machine where this was found, the offending files were **eight weeks old** and
+   one dated to the repository's creation. Fixed by reclaiming orphans (proven
+   orphaned by an exclusive open) rather than adopting them. §6's generation
+   stamping made the collision survivable first; it was a fuse, not a cure.
+2. **Inline heap exhaustion** (§7), which needed no leak at all: the shared bump
+   allocator was reclaimed only on global quiescence, an instant that may never
+   arrive under sustained overlap. Fixed by per-slot arenas (§8).
+3. **Headers outliving their mapping**: `init_control` derived the layout from
+   the *requested* `region_size` while the mapping might have been adopted at a
+   smaller size. Since every bounds check validates against the header, they
+   became rubber stamps for out-of-bounds access. `init_control` now refuses to
+   write a header it cannot back, and `validate_control` enforces
+   `heap_offset + heap_size <= mapping length`.
+
+The original `0xC0000005` was never confirmed against a crash dump, and §2b's
+plan to capture one was never executed. It is no longer worth doing: fault 1
+fully explains the reported symptom, and the mechanisms that could produce a wild
+write have been removed by construction rather than guarded against.
+
+**Original context:** A downstream hub worker (`agent-server` in the ai-notifications project) crash-looped with Windows exit code `3221225477` = `0xC0000005` (ACCESS_VIOLATION), ~once a minute, under a high-churn reconnect storm (two clients fighting over one identity → rapid concurrent `dispatch` + slot reuse + a 3s reaper running alongside). The access violation signature points at a wild pointer deref in `unsafe` SHM code, not safe Rust.
 
 ---
 
@@ -21,9 +53,15 @@ Also shipped downstream (not in slotbus): `agent-server/src/channel.rs::connect(
 
 ---
 
-## 2. What is NOT fixed (the actual work)
+## 2. What was still unknown at the time — SUPERSEDED
 
-### 2a. Root trigger unconfirmed
+> Everything below this heading was written before the root cause was known, and
+> is retained only as a record of the reasoning. Item 1 was factually wrong.
+> Items 2 and 3 were real observations about the shared allocator, which no
+> longer exists as of §8. The actual cause was none of the three — see *What it
+> actually was* at the top.
+
+### 2a. Root trigger unconfirmed (as it stood then)
 Static analysis did **not** yield a clean "reset-while-reading" window, because the slot lifecycle already protects a slot's own heap bytes:
 - `claim_free_slot` CASes `FREE→WRITING` (region.rs:350) **before** `write_request` bumps/writes the heap.
 - The slot stays non-FREE (`WRITING`→`READY`→`CLAIMED`→`DONE`) through the whole produce/consume cycle.
@@ -36,8 +74,11 @@ So the simple TOCTOU story (reset the shared bump allocator while a reader holds
 2. **Reset/reader memory ordering** — `reset_heap` stores `alloc_head` with `Release` (region.rs:202) but no reader ever loads `alloc_head`; readers trust per-slot offset fields. There is no happens-before edge between a reset and an in-flight reader. If *any* reader-while-FREE window exists (e.g. an error path that frees a slot before a deref, or a future refactor), it is unprotected.
 3. **Non-atomic slot field reads** — `read_request`/`read_response` read `meta_offset`/`meta_len`/`body_offset`/`body_len` as plain field loads. They're published via the status atomic (Release on `store(READY/DONE)`, Acquire on the claim CAS), so they're consistent *for the current request*. Audit that nothing reads these fields without first winning the status CAS.
 
-### 2b. Get a crash dump to confirm
-Static analysis is inconclusive on the exact faulting deref. Capture it:
+### 2b. Get a crash dump to confirm — NOT DONE, and no longer needed
+Never executed. Fault 1 (orphaned backing files) explains the reported symptom
+on its own, and per-slot arenas removed the shared-allocator races by
+construction. Retained in case the access violation ever recurs, in which case
+this is still the right first move:
 - Enable WER local dumps for the worker exe (`HKLM\...\Windows Error Reporting\LocalDumps`) or run under a debugger, reproduce the storm, read the faulting address + stack. Expect it in `heap_read`/`read_overflow`/`from_raw_parts` or `postcard::from_bytes` on a bogus length.
 - Repro without the downstream app: a stress test that spawns N concurrent `dispatch` calls with bodies straddling the inline-heap/overflow boundary, while slots churn FREE↔busy and `try_reset_heap` fires. Assert no crash + no `InvalidRegion` errors.
 
@@ -59,19 +100,27 @@ Minimum to call it "fixed": ~~C~~ + **D** (done) + **A or B** (the actual heap r
 
 ## 4. Key locations
 
-| Concern | File:line |
+Deliberately **no line numbers**. An earlier revision of this table carried them,
+they drifted, and one stale pointer is what produced the false "item C" claim in
+§2a — the line had moved, the reader trusted the number instead of the function
+body, and a fix was proposed for a bug that never existed. Grep for the symbol.
+
+| Concern | File |
 |---|---|
-| `heap_read` (unsafe `from_raw_parts`) | `slotbus/src/region.rs:157` |
-| `heap_read_checked` (shipped guard) | `slotbus/src/region.rs` (just after `heap_read`) |
-| `alloc_heap` / `reset_heap` / `try_reset_heap` / `has_inflight_slots` | `slotbus/src/region.rs:175,200,206,217` |
-| `read_request` / `read_response` (now bounds-checked) | `slotbus/src/region.rs:545,580` |
+| `heap_read` (unsafe `from_raw_parts`) | `slotbus/src/region.rs` |
+| `heap_read_checked` / `heap_write_checked` (0.1.3 guards) | `slotbus/src/region.rs` |
+| `slot_arenas` / arena placement (0.2.0, replaced the allocator) | `slotbus/src/region.rs` |
+| `alloc_heap` / `reset_heap` / `try_reset_heap` (deprecated, unused by the protocol) | `slotbus/src/region.rs` |
+| `has_inflight_slots` (still live — diagnostics only) | `slotbus/src/region.rs` |
+| `read_request` / `read_response` | `slotbus/src/region.rs` |
 | `read_overflow` (bounds-checked since initial release) | `slotbus/src/region.rs` |
 | `create_exclusive` / `create_overflow_fresh` (generation stamping) | `slotbus/src/region.rs` |
-| `claim_free_slot` (FREE→WRITING) | `slotbus/src/region.rs:345` |
-| status stores (WRITING/READY/DONE/FREE) | `slotbus/src/region.rs:395,478,556` |
-| `dispatch` (try_reset_heap + claim + overflow remove) | `slotbus/src/transport.rs:142,144,152` |
-| hub response watcher (read before DONE→FREE, then try_reset_heap) | `slotbus/src/transport.rs:218-271` |
-| worker receive loop (READY→CLAIMED, read_request, err→FREE) | `slotbus/src/transport.rs:459-505` |
+| `reclaim_orphaned_backing_file` / `backing_file_path` (0.2.0, Windows only) | `slotbus/src/region.rs` |
+| `init_control` / `validate_control` (header-vs-mapping invariant) | `slotbus/src/region.rs` |
+| `claim_free_slot` (FREE→WRITING) | `slotbus/src/region.rs` |
+| `dispatch` (claim + overflow remove) | `slotbus/src/transport.rs` |
+| hub response watcher (read before DONE→FREE) | `slotbus/src/transport.rs` |
+| worker receive loop (READY→CLAIMED, read_request, err→FREE) | `slotbus/src/transport.rs` |
 
 ## 5. Downstream rebuild note
 slotbus reaches the downstream app (ai-notifications) as a path dep of every hub worker. After any slotbus change, rebuild them all — an un-rebuilt worker stays wire-compatible but takes the wild write instead of the clean error.
@@ -108,7 +157,12 @@ need 76533, have 4096 (stale same-name mapping still open)
 2. New `create_overflow_fresh(name_for, data)` walks generations until it wins a create, returning the region plus a **marker** byte to store in the slot.
 3. The `body_overflow` / `resp_body_overflow` slot bytes now encode `0 = inline`, `n = overflow generation n - 1`. Readers derive the region name from the marker instead of assuming the base name.
 
-**No layout change and no version bump.** `SlotMeta` is untouched at 128 bytes — its 40 reserved bytes were *not* needed — `SHM_VERSION` stays 1, and generation 0 produces the byte-identical un-suffixed name older peers derive. The uncontended path is therefore wire-identical to 0.1.3 in both directions.
+**No layout change and no version bump** *(true of this change in isolation; superseded by §8)*. `SlotMeta` is untouched at 128 bytes — its 40 reserved bytes were *not* needed — `SHM_VERSION` stayed 1 for this change, and generation 0 produces the byte-identical un-suffixed name older peers derive. The uncontended path was therefore wire-identical to 0.1.3 in both directions.
+
+> Superseded: per-slot arenas (§8) bumped `SHM_VERSION` to 2 in the same 0.2.0
+> release, so there is no shipped version where generation stamping is present
+> and the wire protocol is still v1. The graceful-degradation property described
+> here never had to be relied on in practice.
 
 **Mixed-version behaviour.** A peer running older slotbus reads any non-zero marker as "generation 0" and would fail to find a suffixed region. That only happens once a generation above 0 is in use — i.e. exactly the situation where the older code could not have written the payload at all, since it returned the "too small for write" error above. So nothing that previously worked regresses, and **no lockstep rebuild is required**. Rebuilding everything is still *preferable*, since that is what actually cures the symptom, but a straggler degrades to current behaviour rather than breaking.
 

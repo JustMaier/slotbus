@@ -145,6 +145,12 @@ Install it separately: `cargo install slotbus-hub` — see the [slotbus-hub repo
 
 The shared memory layer uses the [`shared_memory`](https://crates.io/crates/shared_memory) crate, which supports all three platforms. The signaling layer uses platform-native primitives for sub-microsecond wake latency on Windows and Linux. macOS uses a polling fallback (~1ms resolution) since `sem_timedwait` is not available.
 
+**Known limitation — orphaned regions on Unix.** A named region is backed by an OS object that is only removed on a clean shutdown, so a hard kill (`SIGKILL`, a crash, a supervisor swapping binaries) leaves it behind. A later run then finds the name taken and, if it adopts the stale object, gets one sized for the *previous* run.
+
+On Windows slotbus reclaims such an orphan: it proves the object is unused by opening it exclusively — which fails while any live process holds it — and only then replaces it. On Linux and macOS there is no equivalent check. `shm_open` has no share modes, and nothing in a POSIX segment identifies whether its owner is still alive; every available liveness inference is racy, and guessing wrong would delete a region still in use. Since a wrong reclaim is far worse than no reclaim, Unix leaves orphans in place.
+
+Practical impact: after an unclean shutdown on Unix, stale entries can accumulate under `/dev/shm`. Remove them (`rm /dev/shm/slotbus-*`) if a restart reports a region at an unexpected size.
+
 ---
 
 <details>
@@ -166,8 +172,8 @@ The shared memory layer uses the [`shared_memory`](https://crates.io/crates/shar
           │                                                                      │
           │  ┌────────────────────────────────────────────────────────────────┐   │
           │  │  Header (64 bytes)                                            │   │
-          │  │  magic: 0x48554231 | version: 1 | num_slots: 32              │   │
-          │  │  heap_offset | heap_size | alloc_head (AtomicU32)             │   │
+          │  │  magic: 0x48554231 | version: 2 | num_slots: 32              │   │
+          │  │  heap_offset | heap_size | alloc_head (legacy, unused)        │   │
           │  └────────────────────────────────────────────────────────────────┘   │
           │                                                                      │
           │  ┌──────────┐ ┌──────────┐ ┌──────────┐         ┌──────────┐        │
@@ -183,10 +189,11 @@ The shared memory layer uses the [`shared_memory`](https://crates.io/crates/shar
           │  └──────────┘ └──────────┘ └──────────┘         └──────────┘        │
           │                                                                      │
           │  ┌────────────────────────────────────────────────────────────────┐   │
-          │  │  Inline Heap (~1MB - header - slots)                          │   │
-          │  │  Bump-allocated. Metadata and small bodies written here.      │   │
-          │  │  CAS on alloc_head for thread-safe allocation.                │   │
-          │  │  Auto-reset when all slots are Free.                          │   │
+          │  │  Inline Heap (~region - header - slots)                       │   │
+          │  │  Divided into one fixed arena per slot, each split into a     │   │
+          │  │  request half and a response half. A slot owns its arena and  │   │
+          │  │  rewrites the same bytes every cycle — no allocator state,    │   │
+          │  │  nothing to reclaim, no cross-slot coupling.                  │   │
           │  └────────────────────────────────────────────────────────────────┘   │
           └──────────────────────────────────────────────────────────────────────┘
 
@@ -230,7 +237,7 @@ No mutexes. No spinlocks. Just atomic CAS with `Acquire`/`Release` ordering to e
 ### Request Lifecycle
 
 1. **Hub** finds a free slot (linear scan, typically slot 0 or 1 for low-traffic workloads).
-2. **Hub** bump-allocates space on the inline heap for serialized `RequestMeta` (path, headers, query params) and the request body.
+2. **Hub** writes the serialized `RequestMeta` (path, headers, query params) and the request body into that slot's own arena — a fixed sub-range of the inline heap, at a fixed offset. No allocation.
 3. **Hub** writes metadata pointers and body pointers into the slot's fixed-size fields (128 bytes per slot).
 4. **Hub** atomically sets the slot status from `Free` to `Ready` with `Release` ordering.
 5. **Hub** signals the request event — the worker wakes up in under 1 microsecond.
@@ -242,11 +249,21 @@ No mutexes. No spinlocks. Just atomic CAS with `Acquire`/`Release` ordering to e
 
 ### Inline Heap + Overflow
 
-The control region contains a bump-allocated heap after the header and slots. Small payloads (metadata, typical JSON bodies) are written inline — no extra allocations, no extra shared memory regions.
+The control region contains an inline heap after the header and slots, divided into one fixed **arena per slot**. Each arena is split into a request half and a response half, so a slot's request and response bytes never disturb each other regardless of read-completion ordering. Small payloads (metadata, typical JSON bodies) are written inline — no allocation, no extra shared memory regions, and no reclamation step.
 
-When the heap is full, large payloads spill to **overflow regions**: temporary named shared memory mappings (`slotbus-{name}-req-{slot}` or `slotbus-{name}-rsp-{slot}`). These are created on demand and kept alive until the slot is freed.
+The inline ceiling per direction is therefore roughly:
 
-The heap resets automatically when all slots return to `Free` — no fragmentation, no GC.
+```
+region_size / num_slots / 2
+```
+
+Size `region_size` so your typical payload fits. At 32 slots in a 1 MB region that is ~16 KB per direction; raise the region to raise the ceiling.
+
+Payloads above the ceiling spill to **overflow regions**: temporary named shared memory mappings (`slotbus-{name}-req-{slot}` or `slotbus-{name}-rsp-{slot}`), created on demand and released when the slot is freed. Spilling is supported and correct, but it is markedly slower than an inline write — releasing an overflow mapping costs on the order of tens of milliseconds, so keeping common payloads inline is worth the region size.
+
+Overflow region names are generation-stamped, so a slow reader can never be handed a *new* region created for a reused slot under the same name.
+
+> **Earlier versions** used a single bump allocator shared by every slot, reclaimed only when all slots were simultaneously `Free`. Under sustained overlap that instant may never arrive, so the heap could exhaust with nothing leaking. Per-slot arenas removed the shared allocator entirely; this is the wire change behind `SHM_VERSION` 2.
 
 ### Serialization
 
